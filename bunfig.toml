@@ -1,0 +1,3 @@
+[install]
+# Keep the code generator's legacy compiler API separate from native TypeScript 7.
+linker = "isolated"
