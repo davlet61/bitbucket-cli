@@ -83,8 +83,10 @@ published comment is left alone. Deleted comments or unknown pending state are
 rejected. There is no publish-all operation, approval, or automatic review submission.
 
 Updates accept exactly one of `--body` or `--body-file` (including `-` for stdin).
-They read the current comment, then send the replacement `content.raw` and the
-existing `pending` value. No discriminator or inline anchor is sent. `--pending`,
+They read the current comment, then send only the replacement `content.raw`.
+Bitbucket rejects `pending` in text-update requests (`extra keys not allowed`),
+so state is checked in the response rather than included in the PUT body.
+No discriminator or inline anchor is sent. `--pending`,
 `--file`, `--line`, and `--side` are rejected on updates; publication is a separate
 command. The response must confirm the comment ID, text, and unchanged publication
 state. Editing an already-published comment changes its visible text immediately.

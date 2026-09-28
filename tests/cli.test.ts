@@ -277,14 +277,19 @@ describe('pending comment workflow', () => {
 });
 
 describe('comment updates', () => {
-  test.each([true, false])('updates text while preserving pending=%s and leaving the anchor alone', async (pending) => {
+  test.each([true, false])('updates text without the pending field rejected by Bitbucket (state=%s)', async (pending) => {
     const log = spyOn(console, 'log').mockImplementation(() => {});
     const inline = { path: 'src/file.ts', to: 9 };
     const network = respond(async (request) => {
       expect(request.url).toBe(`${collection}/42/comments/7`);
       if (request.method === 'GET') return Response.json({ id: 7, pending, inline, content: { raw: 'Original' } });
       expect(request.method).toBe('PUT');
-      expect(await request.json()).toEqual({ content: { raw: 'Revised\n\n**finding**' }, pending });
+      const body = await request.json();
+      // Replay the reported live PUT rejection; POST accepts this field, PUT does not.
+      if ('pending' in body) return Response.json({
+        error: { message: 'Bad request', fields: { pending: 'extra keys not allowed' } },
+      }, { status: 400 });
+      expect(body).toEqual({ content: { raw: 'Revised\n\n**finding**' } });
       return Response.json({ id: 7, pending, inline, content: { raw: 'Revised\n\n**finding**' } });
     });
     await main(['pr', 'comment', 'update', '42', '7', '-R', 'team/project', '--body', 'Revised\n\n**finding**', '--json']);
@@ -301,7 +306,7 @@ describe('comment updates', () => {
       await writeFile(file, raw);
       respond(async (request) => {
         if (request.method === 'GET') return Response.json({ id: 7, pending: true });
-        expect(await request.json()).toEqual({ content: { raw }, pending: true });
+        expect(await request.json()).toEqual({ content: { raw } });
         return Response.json({ id: 7, pending: true, content: { raw } });
       });
       await main(['pr', 'comment', 'update', '42', '7', '-R', 'team/project', '--body-file', file]);

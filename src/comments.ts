@@ -75,8 +75,9 @@ export async function updateComment(client: Client, path: PrPath, commentId: num
   }
   let data: ReviewComment;
   try {
-    // Keep the existing publication state; never send `type` or change the anchor.
-    const body: Partial<ReviewComment> = { content: { raw }, pending: current.pending };
+    // Text updates reject `pending` (and `type`); send only the editable content.
+    // Verify publication state in the response instead of attempting to write it.
+    const body: Partial<ReviewComment> = { content: { raw } };
     const result = await putComment({ client, path: commentPath, body: body as PullrequestComment, throwOnError: true });
     data = result.data as ReviewComment;
   } catch (error) {
