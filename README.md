@@ -37,6 +37,7 @@ bb pr comments <id> [--pending]
 bb pr comment add <id> --body <text> [--pending]
     [--file <path> --line <n> [--side old|new]]
 bb pr comment pending <id>
+bb pr comment update <id> <comment-id> --body <text>
 bb pr comment publish <id> <comment-id>
 ```
 
@@ -63,6 +64,10 @@ printf '%s\n' 'General review note' | bb pr comment add 123 --body-file -
 bb pr comment pending 123
 bb pr comments 123 --pending --json
 
+# Replace text without intentionally changing pending/published state or location.
+bb pr comment update 123 456 --body 'Revised finding.'
+bb pr comment update 123 456 --body-file review.md --json
+
 # Publish one explicitly selected comment by its returned Bitbucket ID.
 bb pr comment publish 123 456
 ```
@@ -77,12 +82,24 @@ then updates only `pending: false`, preserving content and anchors. An already
 published comment is left alone. Deleted comments or unknown pending state are
 rejected. There is no publish-all operation, approval, or automatic review submission.
 
+Updates accept exactly one of `--body` or `--body-file` (including `-` for stdin).
+They read the current comment, then send the replacement `content.raw` and the
+existing `pending` value. No discriminator or inline anchor is sent. `--pending`,
+`--file`, `--line`, and `--side` are rejected on updates; publication is a separate
+command. The response must confirm the comment ID, text, and unchanged publication
+state. Editing an already-published comment changes its visible text immediately.
+Updates are read-then-write, not atomic against concurrent edits/publication;
+avoid editing the same comment from multiple sessions at once.
+
 **Important:** the [API documentation](https://developer.atlassian.com/cloud/bitbucket/rest/api-group-pullrequests/)
 includes `pending` in comment POST/PUT schemas, but does not explain publication
-semantics or document a batch publish-review endpoint. These workflows are tested
-with mocked HTTP, **not a live PR**. Verify draft privacy, listing visibility, and
-publication on a test PR before relying on them. Listing filters the comments the
-API returns; it does not guarantee every web-UI draft is exposed.
+semantics or document a batch publish-review endpoint. An authorized live creation
+probe was rejected with HTTP 400 and `fields: {"type":"extra keys not allowed"}`.
+After omitting `type`, a second authorized probe succeeded; creation, read-back,
+and listing confirmed `pending: true`. **Updates, publication, and visibility to
+other users are not yet live-verified.** Verify those on a test PR before relying
+on them. Listing filters the comments the API returns; it does not guarantee every
+web-UI draft is exposed.
 
 The CLI requires the expected pending state in write responses before reporting
 success. If Bitbucket ignores pending on creation, the comment may already be
@@ -106,7 +123,9 @@ Optional standalone binary (for the current platform):
 ```sh
 bun run build
 ./dist/bb --help
-# Optionally install dist/bb into a directory on your PATH.
+
+# Build and install/update ~/.local/bin/bb (ensure ~/.local/bin is on PATH).
+bun run install:local
 ```
 
 ## Development
@@ -122,7 +141,7 @@ bun run build       # Optional standalone binary; not needed for development
 - `src/generated/`: checked-in generated types, SDK functions, and fetch client; never hand-edit.
 - `src/config.ts`: authentication and Git remote inference.
 - `src/api.ts`: client configuration, errors, and guarded pagination.
-- `src/comments.ts`: pending-comment input validation, creation, and publication.
+- `src/comments.ts`: comment input validation, pending creation, text updates, and publication.
 - `src/cli.ts`: argument handling, SDK calls, and output.
 - `tests/cli.test.ts`: offline checks through the actual generated SDK with mocked HTTP.
 
@@ -138,7 +157,10 @@ spec snapshot; generation itself requires no network.
 
 The comment adapter restores inherited fields from the generated `Comment` type:
 the generated `Omit<Comment, 'type'>` loses named properties because that schema
-has an index signature. This workaround is local to `src/comments.ts`.
+has an index signature. The same module omits the response discriminator `type`
+from writes: the live create endpoint rejects it, although the generated request
+schema requires it. Type assertions are confined to the SDK calls; generated
+files and the upstream spec are not hand-edited.
 
 ### Update the specification
 
@@ -159,6 +181,6 @@ versions explicitly and keep `bun.lock` in Git.
 
 ## Next slice
 
-Live verification of pending comments on an explicitly selected test PR, then
-approval and request-changes workflows. No live authenticated writes have been
-performed during implementation.
+Live verification of text updates, publication, and draft privacy on an explicitly
+selected test PR, then approval and request-changes workflows. Pending creation
+and read-back have been verified; the diagnostic comment was left pending.

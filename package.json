@@ -14,7 +14,8 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "check": "bun run typecheck && bun test",
-    "build": "bun build --compile src/cli.ts --outfile dist/bb"
+    "build": "bun build --compile src/cli.ts --outfile dist/bb",
+    "install:local": "bun run build && mkdir -p \"$HOME/.local/bin\" && install -m 755 dist/bb \"$HOME/.local/bin/bb\""
   },
   "devDependencies": {
     "@types/bun": "1.4.2",

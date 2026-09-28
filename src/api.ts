@@ -15,12 +15,17 @@ export function createBitbucketClient(env: Env = process.env, fetchImpl: typeof 
   client.interceptors.request.use((request) => new Request(request, { signal: AbortSignal.timeout(30_000) }));
   client.interceptors.error.use((error, response) => {
     if (!response) return error instanceof Error ? error : new Error('Bitbucket request failed.');
-    const message = typeof error === 'object' && error !== null && 'error' in error
-      ? (error as { error?: { message?: unknown } }).error?.message
-      : undefined;
-    const detail = typeof message === 'string' ? `: ${message}` : '';
+    const envelope = typeof error === 'object' && error !== null && 'error' in error ? error.error : undefined;
+    const info = typeof envelope === 'object' && envelope !== null ? envelope as Record<string, unknown> : {};
+    const message = typeof info.message === 'string' ? `: ${info.message}` : '';
+    // Preserve validation details without dumping request headers or the whole response.
+    const diagnostics = ['detail', 'fields', 'data'].flatMap((key) => {
+      const value = info[key];
+      return value === undefined || value === null ? [] : [`${key}: ${typeof value === 'string' ? value : JSON.stringify(value)}`];
+    });
     const retry = response.headers.get('retry-after');
-    return new Error(`Bitbucket HTTP ${response.status}${detail}${retry ? ` (Retry-After: ${retry})` : ''}`);
+    const status = `Bitbucket HTTP ${response.status}${message}${retry ? ` (Retry-After: ${retry})` : ''}`;
+    return new Error([status, ...diagnostics].join('\n'));
   });
   return client;
 }

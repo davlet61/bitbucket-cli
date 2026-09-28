@@ -2,7 +2,7 @@
 import { parseArgs, stripVTControlCharacters } from 'node:util';
 import { collectPages, createBitbucketClient } from './api.ts';
 import { resolveRepository } from './config.ts';
-import { addPendingComment, pendingBody, positiveId, publishComment, type ReviewComment } from './comments.ts';
+import { addPendingComment, pendingBody, positiveId, publishComment, readCommentBody, updateComment, type ReviewComment } from './comments.ts';
 import {
   getRepositoriesByWorkspaceByRepoSlugPullrequests as listPullrequests,
   getRepositoriesByWorkspaceByRepoSlugPullrequestsByPullRequestId as getPullrequest,
@@ -21,10 +21,12 @@ Usage:
   bb pr comment add <id> --body <text> [--pending]
       [--file <path> --line <n> [--side old|new]]
   bb pr comment pending <id>
+  bb pr comment update <id> <comment-id> --body <text>
   bb pr comment publish <id> <comment-id>
 
 Comment creation defaults to pending. Use --body-file <path|-> instead of
 --body for a file or stdin. --line uses the new diff side unless --side old.
+Updates replace the text and retain the comment's pending/published state.
 Publication is per-comment, not a batch review submission.
 
 Options:
@@ -36,7 +38,7 @@ Authentication (environment variables):
   BITBUCKET_EMAIL + BITBUCKET_API_TOKEN, or BITBUCKET_ACCESS_TOKEN
   Without credentials, requests are anonymous.
 
-Pending writes follow the API schema but have not been live-verified.
+Pending creation/read-back is live-verified; updates and publication are not.
 The CLI checks returned state; verify draft privacy on a test PR first.`;
 
 function print(value: string) {
@@ -81,23 +83,30 @@ export async function main(args = process.argv.slice(2)) {
   const [resource, command] = positionals;
   const action = command === 'comment' ? positionals[2] : undefined;
   if (resource !== 'pr' || !['list', 'view', 'diff', 'comments', 'comment'].includes(command ?? '') ||
-      (command === 'comment' && !['add', 'pending', 'publish'].includes(action ?? ''))) {
+      (command === 'comment' && !['add', 'pending', 'publish', 'update'].includes(action ?? ''))) {
     throw new Error('Unknown command. Run bb --help.');
   }
-  const expectedArgs = command === 'list' ? 2 : command === 'comment' ? (action === 'publish' ? 5 : 4) : 3;
+  const needsCommentId = action === 'publish' || action === 'update';
+  const expectedArgs = command === 'list' ? 2 : command === 'comment' ? (needsCommentId ? 5 : 4) : 3;
   if (positionals.length !== expectedArgs) throw new Error('Unexpected or missing arguments. Run bb --help.');
   const id = command === 'list' ? undefined : positiveId(positionals[command === 'comment' ? 3 : 2], 'PR id');
-  const commentId = action === 'publish' ? positiveId(positionals[4], 'Comment id') : undefined;
+  const commentId = needsCommentId ? positiveId(positionals[4], 'Comment id') : undefined;
   const state = values.state ?? 'OPEN';
   if (values.state !== undefined && command !== 'list') throw new Error('--state is only supported by pr list.');
   if (!['OPEN', 'MERGED', 'DECLINED', 'SUPERSEDED'].includes(state)) throw new Error('Invalid PR state.');
-  for (const flag of ['body', 'body-file', 'file', 'line', 'side'] as const) {
+  for (const flag of ['body', 'body-file'] as const) {
+    if (values[flag] !== undefined && action !== 'add' && action !== 'update') {
+      throw new Error(`--${flag} is only supported by pr comment add or update.`);
+    }
+  }
+  for (const flag of ['file', 'line', 'side'] as const) {
     if (values[flag] !== undefined && action !== 'add') throw new Error(`--${flag} is only supported by pr comment add.`);
   }
   if (values.pending && command !== 'comments' && action !== 'add' && action !== 'pending') {
     throw new Error('--pending is only supported by comments, comment pending, or comment add.');
   }
   const body = action === 'add' ? await pendingBody(values) : undefined;
+  const updatedText = action === 'update' ? await readCommentBody(values) : undefined;
 
   const repository = resolveRepository(values.repo);
   const client = createBitbucketClient();
@@ -130,6 +139,12 @@ export async function main(args = process.argv.slice(2)) {
         const comment = await addPendingComment(client, path, body!);
         if (values.json) json(comment);
         else print(`Created pending comment #${comment.id}.\n${formatComment(comment)}`);
+        break;
+      }
+      if (action === 'update') {
+        const comment = await updateComment(client, path, commentId!, updatedText!);
+        if (values.json) json(comment);
+        else print(`Updated comment #${commentId} (${comment.pending ? 'pending' : 'published'}).\n${formatComment(comment)}`);
         break;
       }
       if (action === 'publish') {

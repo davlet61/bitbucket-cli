@@ -129,6 +129,23 @@ describe('CLI through the generated SDK', () => {
 });
 
 describe('pending comment workflow', () => {
+  test('omits the type discriminator rejected by the live comment endpoint', async () => {
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    const network = respond(async (request) => {
+      const body = await request.json();
+      // Recorded rejection from the authorized pending-only probe on PR #965.
+      if ('type' in body) return Response.json({
+        error: { message: 'Bad request', fields: { type: 'extra keys not allowed' } },
+      }, { status: 400 });
+      return Response.json({ ...body, type: 'pullrequest_comment', id: 7 }, { status: 201 });
+    });
+    for (const anchor of [[], ['--file', 'src/file.ts', '--line', '9']]) {
+      await main(['pr', 'comment', 'add', '42', '-R', 'team/project', '--body', 'Diagnostic fixture', '--json', ...anchor]);
+    }
+    expect(network).toHaveBeenCalledTimes(2);
+    for (const call of log.mock.calls) expect(JSON.parse(call[0])).toMatchObject({ id: 7, pending: true });
+  });
+
   test('creates a pending inline comment by default through the SDK', async () => {
     process.env.BITBUCKET_ACCESS_TOKEN = 'test-token';
     const log = spyOn(console, 'log').mockImplementation(() => {});
@@ -137,7 +154,7 @@ describe('pending comment workflow', () => {
       expect(request.method).toBe('POST');
       expect(request.headers.get('Authorization')).toBe('Bearer test-token');
       const body = await request.json();
-      expect(body).toEqual({ type: 'pullrequest_comment', pending: true, content: { raw: 'Check this' }, inline: { path: 'src/file.ts', to: 9 } });
+      expect(body).toEqual({ pending: true, content: { raw: 'Check this' }, inline: { path: 'src/file.ts', to: 9 } });
       return Response.json({ ...body, id: 7 }, { status: 201 });
     });
     await main(['pr', 'comment', 'add', '42', '-R', 'team/project', '--body', 'Check this', '--file', 'src/file.ts', '--line', '9', '--json']);
@@ -151,7 +168,7 @@ describe('pending comment workflow', () => {
       const file = join(dir, 'comment.md');
       await writeFile(file, 'Review\n\n```ts\noldCode();\n```\n');
       expect(await pendingBody({ 'body-file': file, file: 'src/file.ts', line: '12', side: 'old' })).toEqual({
-        type: 'pullrequest_comment', pending: true,
+        pending: true,
         content: { raw: 'Review\n\n```ts\noldCode();\n```\n' },
         inline: { path: 'src/file.ts', from: 12 },
       });
@@ -163,7 +180,7 @@ describe('pending comment workflow', () => {
   test('creates general pending comments with an explicit --pending flag', async () => {
     const log = spyOn(console, 'log').mockImplementation(() => {});
     respond(async (request) => {
-      expect(await request.json()).toEqual({ type: 'pullrequest_comment', pending: true, content: { raw: 'General note' } });
+      expect(await request.json()).toEqual({ pending: true, content: { raw: 'General note' } });
       return Response.json({ id: 8, pending: true, content: { raw: 'General note' } }, { status: 201 });
     });
     await main(['pr', 'comment', 'add', '42', '-R', 'team/project', '--body', 'General note', '--pending']);
@@ -187,7 +204,7 @@ describe('pending comment workflow', () => {
       expect(request.url).toBe(`${collection}/42/comments/7`);
       if (request.method === 'GET') return Response.json({ id: 7, pending: true, content: { raw: 'Original' } });
       expect(request.method).toBe('PUT');
-      expect(await request.json()).toEqual({ type: 'pullrequest_comment', pending: false });
+      expect(await request.json()).toEqual({ pending: false });
       return Response.json({ id: 7, pending: false, content: { raw: 'Original' } });
     });
     await main(['pr', 'comment', 'publish', '42', '7', '-R', 'team/project', '--json']);
@@ -259,7 +276,125 @@ describe('pending comment workflow', () => {
   });
 });
 
+describe('comment updates', () => {
+  test.each([true, false])('updates text while preserving pending=%s and leaving the anchor alone', async (pending) => {
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    const inline = { path: 'src/file.ts', to: 9 };
+    const network = respond(async (request) => {
+      expect(request.url).toBe(`${collection}/42/comments/7`);
+      if (request.method === 'GET') return Response.json({ id: 7, pending, inline, content: { raw: 'Original' } });
+      expect(request.method).toBe('PUT');
+      expect(await request.json()).toEqual({ content: { raw: 'Revised\n\n**finding**' }, pending });
+      return Response.json({ id: 7, pending, inline, content: { raw: 'Revised\n\n**finding**' } });
+    });
+    await main(['pr', 'comment', 'update', '42', '7', '-R', 'team/project', '--body', 'Revised\n\n**finding**', '--json']);
+    expect(network).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(log.mock.calls[0]?.[0])).toEqual({ id: 7, pending, inline, content: { raw: 'Revised\n\n**finding**' } });
+  });
+
+  test('accepts --body-file and reports the retained state in human output', async () => {
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    const dir = await mkdtemp(join(tmpdir(), 'bb-update-'));
+    try {
+      const file = join(dir, 'comment.md');
+      const raw = 'Updated from file\n';
+      await writeFile(file, raw);
+      respond(async (request) => {
+        if (request.method === 'GET') return Response.json({ id: 7, pending: true });
+        expect(await request.json()).toEqual({ content: { raw }, pending: true });
+        return Response.json({ id: 7, pending: true, content: { raw } });
+      });
+      await main(['pr', 'comment', 'update', '42', '7', '-R', 'team/project', '--body-file', file]);
+      expect(log.mock.calls[0]?.[0]).toContain('Updated comment #7 (pending).');
+      expect(log.mock.calls[0]?.[0]).toContain(raw);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('refuses deleted or unknown-state comments before writing', async () => {
+    let current: object = { id: 7, pending: true, deleted: true };
+    const network = respond((request) => {
+      expect(request.method).toBe('GET');
+      return Response.json(current);
+    });
+    const args = ['pr', 'comment', 'update', '42', '7', '-R', 'team/project', '--body', 'Revised'];
+    await expect(main(args)).rejects.toThrow('deleted');
+    current = { id: 7 };
+    await expect(main(args)).rejects.toThrow('Cannot determine');
+    expect(network).toHaveBeenCalledTimes(2);
+  });
+
+  test('does not retry a failed PUT or claim success', async () => {
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    const network = respond((request) => {
+      if (request.method === 'GET') return Response.json({ id: 7, pending: true });
+      expect(request.method).toBe('PUT');
+      return Response.json({ error: { message: 'Forbidden' } }, { status: 403 });
+    });
+    await expect(main(['pr', 'comment', 'update', '42', '7', '-R', 'team/project', '--body', 'Revised']))
+      .rejects.toThrow('Updating #7 failed: Bitbucket HTTP 403: Forbidden. Not retried');
+    expect(network).toHaveBeenCalledTimes(2);
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  test('rejects an update response with changed state, wrong text, or wrong id', async () => {
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    let result: object;
+    respond((request) => Response.json(request.method === 'GET' ? { id: 7, pending: true } : result));
+    for (const invalid of [
+      { id: 7, pending: false, content: { raw: 'Revised' } },
+      { id: 7, pending: true, content: { raw: 'Original' } },
+      { id: 8, pending: true, content: { raw: 'Revised' } },
+    ]) {
+      result = invalid;
+      await expect(main(['pr', 'comment', 'update', '42', '7', '-R', 'team/project', '--body', 'Revised']))
+        .rejects.toThrow('did not confirm');
+    }
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  test('rejects invalid update arguments without network requests', async () => {
+    const network = respond(() => { throw new Error('Unexpected request'); });
+    const base = ['pr', 'comment', 'update', '42', '7', '-R', 'team/project'];
+    for (const flags of [
+      [], ['--body', ' '], ['--body', 'x', '--body-file', 'file'],
+      ['--body', 'x', '--file', 'src/file.ts'], ['--body', 'x', '--line', '1'],
+      ['--body', 'x', '--side', 'old'], ['--body', 'x', '--pending'],
+    ]) await expect(main([...base, ...flags])).rejects.toThrow();
+    await expect(main(['pr', 'comment', 'update', '42', '--body', 'x'])).rejects.toThrow();
+    await expect(main(['pr', 'comment', 'update', '42', '0', '--body', 'x'])).rejects.toThrow('Comment id');
+    expect(network).not.toHaveBeenCalled();
+  });
+});
+
 describe('API failures and pagination safety', () => {
+  test('preserves validation diagnostics through comment creation errors without retrying', async () => {
+    // Synthetic error envelope: tests diagnostic preservation, not the live 400's cause.
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    const network = respond(() => Response.json({
+      type: 'error',
+      error: {
+        message: 'Bad request',
+        detail: 'Validation failed for the submitted comment.',
+        fields: { content: ['Invalid content.'] },
+        data: { code: 'validation_failed' },
+      },
+      unrelated: 'DO_NOT_DUMP_THE_FULL_RESPONSE',
+    }, { status: 400 }));
+    const failure = await main(['pr', 'comment', 'add', '42', '-R', 'team/project', '--body', 'Diagnostic fixture'])
+      .then(() => { throw new Error('Expected creation to fail'); }, (error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    const message = (failure as Error).message;
+    expect(message).toContain('Bitbucket HTTP 400: Bad request');
+    expect(message).toContain('Validation failed for the submitted comment.');
+    expect(message).toContain('fields: {"content":["Invalid content."]}');
+    expect(message).toContain('data: {"code":"validation_failed"}');
+    expect(message).not.toContain('DO_NOT_DUMP_THE_FULL_RESPONSE');
+    expect(network).toHaveBeenCalledTimes(1);
+    expect(log).not.toHaveBeenCalled();
+  });
+
   test('reports HTTP errors and rate-limit guidance without credentials', async () => {
     respond(() => Response.json({ error: { message: 'Slow down' } }, { status: 429, headers: { 'Retry-After': '60' } }));
     const client = createBitbucketClient({ BITBUCKET_ACCESS_TOKEN: 'secret' });
