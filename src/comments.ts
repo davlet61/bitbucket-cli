@@ -1,7 +1,9 @@
 import { readFile } from 'node:fs/promises';
 import type { Client } from './generated/client/index.ts';
 import {
+  deleteRepositoriesByWorkspaceByRepoSlugPullrequestsByPullRequestIdCommentsByCommentIdResolve as deleteResolution,
   getRepositoriesByWorkspaceByRepoSlugPullrequestsByPullRequestIdCommentsByCommentId as getComment,
+  postRepositoriesByWorkspaceByRepoSlugPullrequestsByPullRequestIdCommentsByCommentIdResolve as postResolution,
   postRepositoriesByWorkspaceByRepoSlugPullrequestsByPullRequestIdComments as postComment,
   putRepositoriesByWorkspaceByRepoSlugPullrequestsByPullRequestIdCommentsByCommentId as putComment,
 } from './generated/sdk.gen.ts';
@@ -10,8 +12,8 @@ import type { Comment, PullrequestComment } from './generated/types.gen.ts';
 // Hey API's Omit<Comment, 'type'> loses named fields through Comment's index signature.
 export type ReviewComment = PullrequestComment & Pick<Comment, 'id' | 'user' | 'inline' | 'deleted' | 'content'>;
 type PrPath = { workspace: string; repo_slug: string; pull_request_id: number };
-type PendingBody = Pick<Comment, 'content' | 'inline'> & { pending: true };
-type Input = { body?: string; 'body-file'?: string; file?: string; line?: string; side?: string };
+type PendingBody = Pick<Comment, 'content' | 'inline'> & { pending: true; parent?: { id: number } };
+type Input = { body?: string; 'body-file'?: string; file?: string; line?: string; side?: string; 'reply-to'?: string };
 
 export function positiveId(value: string | undefined, name: string): number {
   if (!value || !/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(Number(value))) {
@@ -37,6 +39,10 @@ export async function pendingBody(input: Input): Promise<PendingBody> {
   }
   if (input.side !== undefined && input.file === undefined) throw new Error('--side requires --file and --line.');
   if (input.side !== undefined && !['old', 'new'].includes(input.side)) throw new Error('--side must be old or new.');
+  if (input['reply-to'] !== undefined && input.file !== undefined) {
+    throw new Error('Replies inherit their anchor; --reply-to cannot be combined with --file or --line.');
+  }
+  const parent = input['reply-to'] === undefined ? undefined : { id: positiveId(input['reply-to'], 'Reply-to comment id') };
   let inline: Comment['inline'];
   if (input.file !== undefined) {
     if (!input.file || /[\\\x00-\x1f]/.test(input.file) || input.file.split('/').some((part) => !part || part === '.' || part === '..')) {
@@ -46,7 +52,7 @@ export async function pendingBody(input: Input): Promise<PendingBody> {
     inline = { path: input.file, [input.side === 'old' ? 'from' : 'to']: line };
   }
   const raw = await readCommentBody(input);
-  return { pending: true, content: { raw }, ...(inline ? { inline } : {}) };
+  return { pending: true, content: { raw }, ...(inline ? { inline } : {}), ...(parent ? { parent } : {}) };
 }
 
 export async function addPendingComment(client: Client, path: PrPath, body: PendingBody): Promise<ReviewComment> {
@@ -113,4 +119,35 @@ export async function publishComment(client: Client, path: PrPath, commentId: nu
     throw new Error(`Bitbucket did not confirm publication of #${commentId}; inspect its state before retrying.`);
   }
   return data;
+}
+
+async function readLiveComment(client: Client, commentPath: PrPath & { comment_id: number }): Promise<ReviewComment> {
+  const { data } = await getComment({ client, path: commentPath, throwOnError: true });
+  if (data.deleted) throw new Error(`Comment #${commentPath.comment_id} is deleted.`);
+  return data as ReviewComment;
+}
+
+export async function resolveComment(client: Client, path: PrPath, commentId: number): Promise<ReviewComment> {
+  const commentPath = { ...path, comment_id: commentId };
+  const current = await readLiveComment(client, commentPath);
+  if (current.resolution) return current;
+  try {
+    const { data: resolution } = await postResolution({ client, path: commentPath, throwOnError: true });
+    return { ...current, resolution };
+  } catch (error) {
+    throw new Error(`Resolving #${commentId} failed: ${error instanceof Error ? error.message : 'Unknown error'}. Inspect the thread before re-running.`);
+  }
+}
+
+export async function reopenComment(client: Client, path: PrPath, commentId: number): Promise<ReviewComment> {
+  const commentPath = { ...path, comment_id: commentId };
+  const current = await readLiveComment(client, commentPath);
+  if (!current.resolution) return current;
+  try {
+    await deleteResolution({ client, path: commentPath, throwOnError: true });
+  } catch (error) {
+    throw new Error(`Reopening #${commentId} failed: ${error instanceof Error ? error.message : 'Unknown error'}. Inspect the thread before re-running.`);
+  }
+  const { resolution: _resolution, ...reopened } = current;
+  return reopened;
 }

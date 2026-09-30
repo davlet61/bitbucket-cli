@@ -35,10 +35,12 @@ bb pr view <id>
 bb pr diff <id>
 bb pr comments <id> [--pending]
 bb pr comment add <id> --body <text> [--pending]
-    [--file <path> --line <n> [--side old|new]]
+    [--file <path> --line <n> [--side old|new] | --reply-to <comment-id>]
 bb pr comment pending <id>
 bb pr comment update <id> <comment-id> --body <text>
 bb pr comment publish <id> <comment-id>
+bb pr comment resolve <id> <comment-id>
+bb pr comment reopen <id> <comment-id>
 ```
 
 All commands accept `--repo` / `-R workspace/repository` and `--json`.
@@ -111,6 +113,28 @@ retrying creation. Writes are never automatically retried or deleted.
 The current comment POST/PUT documentation lists `read:pullrequest:bitbucket` for
 API tokens, even though these are writes. Broader future approval/request-changes
 workflows require `write:pullrequest:bitbucket` as well.
+
+### Threads: replies, resolve, reopen
+
+```sh
+# Reply to an existing thread; the reply inherits the parent's file/line anchor.
+bb pr comment add 123 --reply-to 456 --body 'Fixed - handled the empty case.'
+bb pr comment publish 123 789
+
+# Resolve or reopen a thread by its top-level comment ID.
+bb pr comment resolve 123 456
+bb pr comment reopen 123 456
+```
+
+Replies send `parent: {id}` and default to pending like any new comment.
+`--reply-to` cannot be combined with `--file`/`--line`. Resolve and reopen first
+read the comment: deleted comments are rejected, and a thread already in the
+requested state is left alone, so reruns are safe. Otherwise they call
+`POST`/`DELETE …/comments/{id}/resolve`. Failures are reported, never retried.
+
+Live-verified on 2026-09-30: published replies with `parent` (HTTP 201),
+resolution (200), and the 409 `Comment has already been resolved.` returned for
+an already-resolved thread. Pending replies and reopen are not yet live-verified.
 
 ### Use from other repositories
 

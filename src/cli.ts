@@ -2,7 +2,17 @@
 import { parseArgs, stripVTControlCharacters } from 'node:util';
 import { collectPages, createBitbucketClient } from './api.ts';
 import { resolveRepository } from './config.ts';
-import { addPendingComment, pendingBody, positiveId, publishComment, readCommentBody, updateComment, type ReviewComment } from './comments.ts';
+import {
+  addPendingComment,
+  pendingBody,
+  positiveId,
+  publishComment,
+  readCommentBody,
+  reopenComment,
+  resolveComment,
+  updateComment,
+  type ReviewComment,
+} from './comments.ts';
 import {
   getRepositoriesByWorkspaceByRepoSlugPullrequests as listPullrequests,
   getRepositoriesByWorkspaceByRepoSlugPullrequestsByPullRequestId as getPullrequest,
@@ -19,13 +29,18 @@ Usage:
   bb pr diff <id>
   bb pr comments <id> [--pending]
   bb pr comment add <id> --body <text> [--pending]
-      [--file <path> --line <n> [--side old|new]]
+      [--file <path> --line <n> [--side old|new] | --reply-to <comment-id>]
   bb pr comment pending <id>
   bb pr comment update <id> <comment-id> --body <text>
   bb pr comment publish <id> <comment-id>
+  bb pr comment resolve <id> <comment-id>
+  bb pr comment reopen <id> <comment-id>
 
 Comment creation defaults to pending. Use --body-file <path|-> instead of
 --body for a file or stdin. --line uses the new diff side unless --side old.
+--reply-to adds the comment to an existing thread, inheriting its anchor.
+Resolve and reopen act on a thread's top-level comment and are no-ops when the
+thread is already in the requested state.
 Updates replace the text and retain the comment's pending/published state.
 Publication is per-comment, not a batch review submission.
 
@@ -71,6 +86,7 @@ export async function main(args = process.argv.slice(2)) {
       file: { type: 'string' },
       line: { type: 'string' },
       side: { type: 'string' },
+      'reply-to': { type: 'string' },
       pending: { type: 'boolean' },
       json: { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
@@ -83,10 +99,10 @@ export async function main(args = process.argv.slice(2)) {
   const [resource, command] = positionals;
   const action = command === 'comment' ? positionals[2] : undefined;
   if (resource !== 'pr' || !['list', 'view', 'diff', 'comments', 'comment'].includes(command ?? '') ||
-      (command === 'comment' && !['add', 'pending', 'publish', 'update'].includes(action ?? ''))) {
+      (command === 'comment' && !['add', 'pending', 'publish', 'update', 'resolve', 'reopen'].includes(action ?? ''))) {
     throw new Error('Unknown command. Run bb --help.');
   }
-  const needsCommentId = action === 'publish' || action === 'update';
+  const needsCommentId = action === 'publish' || action === 'update' || action === 'resolve' || action === 'reopen';
   const expectedArgs = command === 'list' ? 2 : command === 'comment' ? (needsCommentId ? 5 : 4) : 3;
   if (positionals.length !== expectedArgs) throw new Error('Unexpected or missing arguments. Run bb --help.');
   const id = command === 'list' ? undefined : positiveId(positionals[command === 'comment' ? 3 : 2], 'PR id');
@@ -99,7 +115,7 @@ export async function main(args = process.argv.slice(2)) {
       throw new Error(`--${flag} is only supported by pr comment add or update.`);
     }
   }
-  for (const flag of ['file', 'line', 'side'] as const) {
+  for (const flag of ['file', 'line', 'side', 'reply-to'] as const) {
     if (values[flag] !== undefined && action !== 'add') throw new Error(`--${flag} is only supported by pr comment add.`);
   }
   if (values.pending && command !== 'comments' && action !== 'add' && action !== 'pending') {
@@ -151,6 +167,14 @@ export async function main(args = process.argv.slice(2)) {
         const comment = await publishComment(client, path, commentId!);
         if (values.json) json(comment);
         else print(`Comment #${commentId} is published.`);
+        break;
+      }
+      if (action === 'resolve' || action === 'reopen') {
+        const comment = action === 'resolve'
+          ? await resolveComment(client, path, commentId!)
+          : await reopenComment(client, path, commentId!);
+        if (values.json) json(comment);
+        else print(`Comment #${commentId} is ${action === 'resolve' ? 'resolved' : 'open'}.`);
         break;
       }
       // "comment pending" shares pagination/rendering with "comments --pending".

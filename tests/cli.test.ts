@@ -276,6 +276,88 @@ describe('pending comment workflow', () => {
   });
 });
 
+describe('comment threads', () => {
+  test('creates a pending reply that inherits the parent anchor', async () => {
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    const network = respond(async (request) => {
+      expect(request.url).toBe(`${collection}/42/comments`);
+      const body = await request.json();
+      expect(body).toEqual({ pending: true, content: { raw: 'Fixed' }, parent: { id: 7 } });
+      return Response.json({ ...body, id: 8 }, { status: 201 });
+    });
+    await main(['pr', 'comment', 'add', '42', '-R', 'team/project', '--body', 'Fixed', '--reply-to', '7', '--json']);
+    expect(network).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(log.mock.calls[0]?.[0])).toMatchObject({ id: 8, pending: true, parent: { id: 7 } });
+  });
+
+  test('resolves an open thread after reading it', async () => {
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    const network = respond((request) => {
+      if (request.method === 'GET') {
+        expect(request.url).toBe(`${collection}/42/comments/7`);
+        return Response.json({ id: 7, pending: false });
+      }
+      expect(request.method).toBe('POST');
+      expect(request.url).toBe(`${collection}/42/comments/7/resolve`);
+      return Response.json({ type: 'comment_resolution', created_on: '2026-09-30T00:00:00Z' });
+    });
+    await main(['pr', 'comment', 'resolve', '42', '7', '-R', 'team/project', '--json']);
+    expect(network).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(log.mock.calls[0]?.[0])).toMatchObject({ id: 7, resolution: { type: 'comment_resolution' } });
+  });
+
+  test('does not write when the thread is already in the requested state', async () => {
+    spyOn(console, 'log').mockImplementation(() => {});
+    let current: object = { id: 7, resolution: { type: 'comment_resolution' } };
+    const network = respond((request) => {
+      expect(request.method).toBe('GET');
+      return Response.json(current);
+    });
+    await main(['pr', 'comment', 'resolve', '42', '7', '-R', 'team/project']);
+    current = { id: 7 };
+    await main(['pr', 'comment', 'reopen', '42', '7', '-R', 'team/project']);
+    expect(network).toHaveBeenCalledTimes(2);
+  });
+
+  test('reopens a resolved thread and drops the resolution from the result', async () => {
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    const network = respond((request) => {
+      if (request.method === 'GET') return Response.json({ id: 7, resolution: { type: 'comment_resolution' } });
+      expect(request.method).toBe('DELETE');
+      expect(request.url).toBe(`${collection}/42/comments/7/resolve`);
+      return new Response(null, { status: 204 });
+    });
+    await main(['pr', 'comment', 'reopen', '42', '7', '-R', 'team/project', '--json']);
+    expect(network).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(log.mock.calls[0]?.[0])).not.toHaveProperty('resolution');
+  });
+
+  test('refuses deleted comments and reports failed resolution without retrying', async () => {
+    let current: object = { id: 7, deleted: true };
+    const network = respond((request) => {
+      if (request.method === 'GET') return Response.json(current);
+      return Response.json({ error: { message: 'Comment has already been resolved.' } }, { status: 409 });
+    });
+    const args = ['pr', 'comment', 'resolve', '42', '7', '-R', 'team/project'];
+    await expect(main(args)).rejects.toThrow('deleted');
+    current = { id: 7 };
+    await expect(main(args)).rejects.toThrow('Resolving #7 failed');
+    expect(network).toHaveBeenCalledTimes(3);
+  });
+
+  test('validates thread arguments before any request', async () => {
+    const network = respond(() => { throw new Error('Unexpected request'); });
+    for (const args of [
+      ['pr', 'comment', 'add', '42', '--body', 'x', '--reply-to', '0'],
+      ['pr', 'comment', 'add', '42', '--body', 'x', '--reply-to', '7', '--file', 'a.ts', '--line', '1'],
+      ['pr', 'comment', 'resolve', '42'], ['pr', 'comment', 'reopen', '42', 'all'],
+      ['pr', 'comment', 'resolve', '42', '7', '--body', 'x'],
+      ['pr', 'comment', 'update', '42', '7', '--body', 'x', '--reply-to', '3'],
+    ]) await expect(main([...args, '-R', 'team/project'])).rejects.toThrow();
+    expect(network).not.toHaveBeenCalled();
+  });
+});
+
 describe('comment updates', () => {
   test.each([true, false])('updates text without the pending field rejected by Bitbucket (state=%s)', async (pending) => {
     const log = spyOn(console, 'log').mockImplementation(() => {});
