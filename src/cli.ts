@@ -3,14 +3,16 @@ import { parseArgs, stripVTControlCharacters } from 'node:util';
 import { collectPages, createBitbucketClient } from './api.ts';
 import { resolveRepository } from './config.ts';
 import {
-  addPendingComment,
-  pendingBody,
+  addComment,
+  commentBody,
   positiveId,
   publishComment,
   readCommentBody,
   reopenComment,
   resolveComment,
+  threadRootId,
   updateComment,
+  withThreadResolution,
   type ReviewComment,
 } from './comments.ts';
 import {
@@ -27,8 +29,8 @@ Usage:
   bb pr list [--state OPEN|MERGED|DECLINED|SUPERSEDED]
   bb pr view <id>
   bb pr diff <id>
-  bb pr comments <id> [--pending]
-  bb pr comment add <id> --body <text> [--pending]
+  bb pr comments <id> [--pending | --unresolved] [--author <name>]
+  bb pr comment add <id> --body <text> [--pending | --publish]
       [--file <path> --line <n> [--side old|new] | --reply-to <comment-id>]
   bb pr comment pending <id>
   bb pr comment update <id> <comment-id> --body <text>
@@ -36,7 +38,12 @@ Usage:
   bb pr comment resolve <id> <comment-id>
   bb pr comment reopen <id> <comment-id>
 
-Comment creation defaults to pending. Use --body-file <path|-> instead of
+Comment creation defaults to pending; --publish posts it visibly right away.
+Publishing a pending comment re-creates it as published (new id) and deletes
+the draft, because Bitbucket cannot change pending state in place.
+--unresolved keeps comments in open threads; thread status is read per thread.
+--author matches display name or nickname (case-insensitive), account id or uuid.
+Use --body-file <path|-> instead of
 --body for a file or stdin. --line uses the new diff side unless --side old.
 --reply-to adds the comment to an existing thread, inheriting its anchor.
 Resolve and reopen act on a thread's top-level comment and are no-ops when the
@@ -53,8 +60,7 @@ Authentication (environment variables):
   BITBUCKET_EMAIL + BITBUCKET_API_TOKEN, or BITBUCKET_ACCESS_TOKEN
   Without credentials, requests are anonymous.
 
-Pending creation/read-back is live-verified; updates and publication are not.
-The CLI checks returned state; verify draft privacy on a test PR first.`;
+The CLI checks returned state after every write and never retries writes.`;
 
 function print(value: string) {
   // Remote PR content is untrusted terminal input; JSON output preserves raw data.
@@ -67,7 +73,7 @@ function headline(pr: Pullrequest) {
 
 function formatComment(comment: ReviewComment) {
   return [
-    `#${comment.id ?? '?'}  ${comment.user?.display_name ?? 'Unknown'}${comment.pending ? ' [pending]' : ''}${comment.resolution ? ' [resolved]' : ''}`,
+    `#${comment.id ?? '?'}  ${comment.user?.display_name ?? 'Unknown'}${comment.parent?.id ? ` ↳ #${comment.parent.id}` : ''}${comment.pending ? ' [pending]' : ''}${comment.resolution ? ' [resolved]' : ''}`,
     ...(comment.inline ? [`${comment.inline.path}:${comment.inline.to ?? comment.inline.from ?? '?'}`] : []),
     comment.deleted ? '[deleted]' : comment.content?.raw ?? '',
   ].join('\n');
@@ -88,6 +94,9 @@ export async function main(args = process.argv.slice(2)) {
       side: { type: 'string' },
       'reply-to': { type: 'string' },
       pending: { type: 'boolean' },
+      publish: { type: 'boolean' },
+      unresolved: { type: 'boolean' },
+      author: { type: 'string' },
       json: { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
     },
@@ -121,7 +130,14 @@ export async function main(args = process.argv.slice(2)) {
   if (values.pending && command !== 'comments' && action !== 'add' && action !== 'pending') {
     throw new Error('--pending is only supported by comments, comment pending, or comment add.');
   }
-  const body = action === 'add' ? await pendingBody(values) : undefined;
+  if (values.publish && action !== 'add') throw new Error('--publish is only supported by pr comment add.');
+  if (values.publish && values.pending) throw new Error('Use either --pending or --publish, not both.');
+  for (const flag of ['unresolved', 'author'] as const) {
+    if (values[flag] !== undefined && command !== 'comments') throw new Error(`--${flag} is only supported by pr comments.`);
+  }
+  if (values.unresolved && values.pending) throw new Error('Use either --pending or --unresolved, not both.');
+  if (values.author !== undefined && !values.author.trim()) throw new Error('--author must not be empty.');
+  const body = action === 'add' ? await commentBody(values) : undefined;
   const updatedText = action === 'update' ? await readCommentBody(values) : undefined;
 
   const repository = resolveRepository(values.repo);
@@ -152,9 +168,9 @@ export async function main(args = process.argv.slice(2)) {
     }
     case 'comment': {
       if (action === 'add') {
-        const comment = await addPendingComment(client, path, body!);
+        const comment = await addComment(client, path, body!);
         if (values.json) json(comment);
-        else print(`Created pending comment #${comment.id}.\n${formatComment(comment)}`);
+        else print(`Created ${comment.pending ? 'pending' : 'published'} comment #${comment.id}.\n${formatComment(comment)}`);
         break;
       }
       if (action === 'update') {
@@ -166,7 +182,7 @@ export async function main(args = process.argv.slice(2)) {
       if (action === 'publish') {
         const comment = await publishComment(client, path, commentId!);
         if (values.json) json(comment);
-        else print(`Comment #${commentId} is published.`);
+        else print(comment.id === commentId ? `Comment #${commentId} is published.` : `Published #${commentId} as #${comment.id}.`);
         break;
       }
       if (action === 'resolve' || action === 'reopen') {
@@ -181,11 +197,28 @@ export async function main(args = process.argv.slice(2)) {
     }
     case 'comments': {
       const { data } = await listComments({ ...options, path });
-      const all = await collectPages(client, data) as ReviewComment[];
+      const listed = await collectPages(client, data) as ReviewComment[];
       const onlyPending = action === 'pending' || values.pending;
-      const comments = onlyPending ? all.filter((comment) => comment.pending === true && !comment.deleted) : all;
+      const all = onlyPending ? listed : await withThreadResolution(client, path, listed);
+      const commentsById = new Map(all.map((comment) => [comment.id!, comment]));
+      const author = values.author?.trim().toLowerCase();
+      const comments = all.filter((comment) => {
+        if (onlyPending && (comment.pending !== true || comment.deleted)) return false;
+        if (values.unresolved) {
+          if (comment.deleted) return false;
+          const root = commentsById.get(threadRootId(comment, commentsById) ?? -1);
+          if (!root || root.deleted || root.resolution) return false;
+        }
+        if (author !== undefined) {
+          const user = comment.user as Record<string, unknown> | undefined;
+          const names = [user?.display_name, user?.nickname].filter((name): name is string => typeof name === 'string');
+          const ids = [user?.account_id, user?.uuid].filter((id): id is string => typeof id === 'string');
+          if (!names.some((name) => name.toLowerCase().includes(author)) && !ids.some((id) => id.toLowerCase() === author)) return false;
+        }
+        return true;
+      });
       if (values.json) json(comments);
-      else print(comments.map(formatComment).join('\n\n') || (onlyPending ? 'No pending comments returned by Bitbucket.' : 'No comments.'));
+      else print(comments.map(formatComment).join('\n\n') || (onlyPending ? 'No pending comments returned by Bitbucket.' : 'No matching comments.'));
       break;
     }
     case 'diff': {

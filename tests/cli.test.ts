@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { pendingBody } from '../src/comments.ts';
+import { commentBody } from '../src/comments.ts';
 import { createBitbucketClient, collectPages } from '../src/api.ts';
 import { main } from '../src/cli.ts';
 import { authorization, parseRepository, repositoryFromRemote } from '../src/config.ts';
@@ -99,6 +99,7 @@ describe('CLI through the generated SDK', () => {
   test('renders inherited inline comment fields, including pending state', async () => {
     const log = spyOn(console, 'log').mockImplementation(() => {});
     respond((request) => {
+      if (request.url === `${collection}/42/comments/7`) return Response.json({ id: 7, resolution: null });
       expect(request.url).toBe(`${collection}/42/comments`);
       return Response.json({ values: [{ type: 'pullrequest_comment', id: 7, pending: true, user: { display_name: 'Reviewer' }, inline: { path: 'src/file.ts', to: 9 }, content: { raw: 'Check this' } }] });
     });
@@ -167,7 +168,7 @@ describe('pending comment workflow', () => {
     try {
       const file = join(dir, 'comment.md');
       await writeFile(file, 'Review\n\n```ts\noldCode();\n```\n');
-      expect(await pendingBody({ 'body-file': file, file: 'src/file.ts', line: '12', side: 'old' })).toEqual({
+      expect(await commentBody({ 'body-file': file, file: 'src/file.ts', line: '12', side: 'old' })).toEqual({
         pending: true,
         content: { raw: 'Review\n\n```ts\noldCode();\n```\n' },
         inline: { path: 'src/file.ts', from: 12 },
@@ -198,18 +199,44 @@ describe('pending comment workflow', () => {
     for (const call of log.mock.calls) expect(JSON.parse(call[0])).toEqual([{ id: 3, pending: true }, { id: 4, pending: true }]);
   });
 
-  test('publishes an explicit pending comment without overwriting its content', async () => {
+  test('publishes a pending comment by re-creating it with its anchor and deleting the draft', async () => {
     const log = spyOn(console, 'log').mockImplementation(() => {});
+    const calls: string[] = [];
     const network = respond(async (request) => {
-      expect(request.url).toBe(`${collection}/42/comments/7`);
-      if (request.method === 'GET') return Response.json({ id: 7, pending: true, content: { raw: 'Original' } });
-      expect(request.method).toBe('PUT');
-      expect(await request.json()).toEqual({ pending: false });
-      return Response.json({ id: 7, pending: false, content: { raw: 'Original' } });
+      calls.push(`${request.method} ${request.url.replace(collection, '')}`);
+      if (request.method === 'GET') {
+        return Response.json({ id: 7, pending: true, content: { raw: 'Original' }, inline: { path: 'src/a.ts', to: 3, outdated: false }, parent: { id: 2 } });
+      }
+      if (request.method === 'POST') {
+        expect(await request.json()).toEqual({ content: { raw: 'Original' }, inline: { path: 'src/a.ts', to: 3 }, parent: { id: 2 } });
+        return Response.json({ id: 8, pending: false, content: { raw: 'Original' } }, { status: 201 });
+      }
+      return new Response(null, { status: 204 });
     });
     await main(['pr', 'comment', 'publish', '42', '7', '-R', 'team/project', '--json']);
-    expect(network).toHaveBeenCalledTimes(2);
-    expect(JSON.parse(log.mock.calls[0]?.[0])).toMatchObject({ id: 7, pending: false });
+    expect(calls).toEqual(['GET /42/comments/7', 'POST /42/comments', 'DELETE /42/comments/7']);
+    expect(network).toHaveBeenCalledTimes(3);
+    expect(JSON.parse(log.mock.calls[0]?.[0])).toMatchObject({ id: 8, pending: false });
+  });
+
+  test('reports the published id when deleting the draft fails', async () => {
+    respond((request) => {
+      if (request.method === 'GET') return Response.json({ id: 7, pending: true, content: { raw: 'Original' } });
+      if (request.method === 'POST') return Response.json({ id: 8, pending: false }, { status: 201 });
+      return Response.json({ error: { message: 'Forbidden' } }, { status: 403 });
+    });
+    await expect(main(['pr', 'comment', 'publish', '42', '7', '-R', 'team/project'])).rejects.toThrow('Published #7 as #8');
+  });
+
+  test('creates a published comment with --publish without sending pending', async () => {
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    respond(async (request) => {
+      expect(request.method).toBe('POST');
+      expect(await request.json()).toEqual({ content: { raw: 'Fixed' }, parent: { id: 5 } });
+      return Response.json({ id: 9, pending: false, content: { raw: 'Fixed' } }, { status: 201 });
+    });
+    await main(['pr', 'comment', 'add', '42', '-R', 'team/project', '--body', 'Fixed', '--reply-to', '5', '--publish']);
+    expect(log.mock.calls[0]?.[0]).toContain('Created published comment #9.');
   });
 
   test('does not rewrite an already-published comment on a rerun', async () => {
@@ -235,14 +262,17 @@ describe('pending comment workflow', () => {
     expect(network).toHaveBeenCalledTimes(2);
   });
 
-  test('does not report success if Bitbucket ignores pending on creation or publication', async () => {
+  test('does not report success if Bitbucket returns the wrong pending state', async () => {
     const log = spyOn(console, 'log').mockImplementation(() => {});
-    respond((request) => {
-      if (request.method === 'POST') return Response.json({ id: 7, pending: false }, { status: 201 });
-      return Response.json({ id: 7, pending: true });
+    let created = { id: 7, pending: false };
+    const network = respond((request) => {
+      if (request.method === 'POST') return Response.json(created, { status: 201 });
+      return Response.json({ id: 7, pending: true, content: { raw: 'Note' } });
     });
     await expect(main(['pr', 'comment', 'add', '42', '-R', 'team/project', '--body', 'Note'])).rejects.toThrow('may already be visible');
-    await expect(main(['pr', 'comment', 'publish', '42', '7', '-R', 'team/project'])).rejects.toThrow('did not confirm publication');
+    created = { id: 8, pending: true };
+    await expect(main(['pr', 'comment', 'publish', '42', '7', '-R', 'team/project'])).rejects.toThrow('did not confirm a published comment');
+    expect(network.mock.calls.some(([request]) => (request as Request).method === 'DELETE')).toBe(false);
     expect(log).not.toHaveBeenCalled();
   });
 
@@ -353,6 +383,62 @@ describe('comment threads', () => {
       ['pr', 'comment', 'resolve', '42'], ['pr', 'comment', 'reopen', '42', 'all'],
       ['pr', 'comment', 'resolve', '42', '7', '--body', 'x'],
       ['pr', 'comment', 'update', '42', '7', '--body', 'x', '--reply-to', '3'],
+    ]) await expect(main([...args, '-R', 'team/project'])).rejects.toThrow();
+    expect(network).not.toHaveBeenCalled();
+  });
+});
+
+describe('comment filters', () => {
+  const comments = [
+    { id: 1, user: { display_name: 'Henrik Lia', nickname: 'Henrik Lia' }, content: { raw: 'Resolved root' } },
+    { id: 2, parent: { id: 1 }, user: { display_name: 'Dovlat Yakshibayev' }, content: { raw: 'Fixed' } },
+    { id: 3, user: { display_name: 'Nemanja Dunic', account_id: 'acc-3' }, content: { raw: 'Open root' } },
+    { id: 4, parent: { id: 3 }, user: { display_name: 'Dovlat Yakshibayev' }, content: { raw: 'Reply' } },
+    { id: 5, parent: { id: 4 }, user: { display_name: 'Nemanja Dunic' }, content: { raw: 'Nested reply' } },
+    { id: 6, deleted: true, user: { display_name: 'Nemanja Dunic' } },
+  ];
+  function respondWithThreads() {
+    return respond((request) => {
+      const match = request.url.match(/comments\/(\d+)$/);
+      if (match) return Response.json({ id: Number(match[1]), resolution: match[1] === '1' ? { type: 'comment_resolution' } : null });
+      return Response.json({ values: comments });
+    });
+  }
+
+  test('reads live thread resolution because the list omits it', async () => {
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    const network = respondWithThreads();
+    await main(['pr', 'comments', '42', '-R', 'team/project', '--json']);
+    const listed = JSON.parse(log.mock.calls[0]?.[0]);
+    expect(listed.find((comment: { id: number }) => comment.id === 1).resolution).toEqual({ type: 'comment_resolution' });
+    expect(network).toHaveBeenCalledTimes(3);
+  });
+
+  test('keeps comments in unresolved threads, including nested replies', async () => {
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    respondWithThreads();
+    await main(['pr', 'comments', '42', '-R', 'team/project', '--unresolved', '--json']);
+    expect(JSON.parse(log.mock.calls[0]?.[0]).map((comment: { id: number }) => comment.id)).toEqual([3, 4, 5]);
+  });
+
+  test('filters by author name or account id and combines with --unresolved', async () => {
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    respondWithThreads();
+    await main(['pr', 'comments', '42', '-R', 'team/project', '--author', 'nemanja', '--json']);
+    await main(['pr', 'comments', '42', '-R', 'team/project', '--author', 'ACC-3', '--json']);
+    await main(['pr', 'comments', '42', '-R', 'team/project', '--author', 'dovlat', '--unresolved', '--json']);
+    const ids = log.mock.calls.map((call) => JSON.parse(call[0]).map((comment: { id: number }) => comment.id));
+    expect(ids).toEqual([[3, 5, 6], [3], [4]]);
+  });
+
+  test('validates filter flags before any request', async () => {
+    const network = respond(() => { throw new Error('Unexpected request'); });
+    for (const args of [
+      ['pr', 'comment', 'add', '42', '--body', 'x', '--publish', '--pending'],
+      ['pr', 'comment', 'publish', '42', '7', '--publish'],
+      ['pr', 'list', '--unresolved'],
+      ['pr', 'comments', '42', '--author', ' '],
+      ['pr', 'comments', '42', '--pending', '--unresolved'],
     ]) await expect(main([...args, '-R', 'team/project'])).rejects.toThrow();
     expect(network).not.toHaveBeenCalled();
   });

@@ -33,8 +33,8 @@ credentials in the calling shell; the CLI does not maintain a credential store.
 bb pr list [--state OPEN|MERGED|DECLINED|SUPERSEDED]
 bb pr view <id>
 bb pr diff <id>
-bb pr comments <id> [--pending]
-bb pr comment add <id> --body <text> [--pending]
+bb pr comments <id> [--pending | --unresolved] [--author <name>]
+bb pr comment add <id> --body <text> [--pending | --publish]
     [--file <path> --line <n> [--side old|new] | --reply-to <comment-id>]
 bb pr comment pending <id>
 bb pr comment update <id> <comment-id> --body <text>
@@ -53,7 +53,7 @@ JSON preserves API data. Errors go to stderr with exit status 1.
 Requests have a 30-second timeout per request; rate-limit errors report
 `Retry-After` when present. There are no automatic retries.
 
-### Pending comments (live verification still needed)
+### Pending and published comments
 
 ```sh
 # All new comments default to pending; --pending is optional and explicit.
@@ -72,6 +72,9 @@ bb pr comment update 123 456 --body-file review.md --json
 
 # Publish one explicitly selected comment by its returned Bitbucket ID.
 bb pr comment publish 123 456
+
+# Post a visible comment or reply directly, without a draft.
+bb pr comment add 123 --reply-to 456 --body-file reply.md --publish
 ```
 
 `--file` is the path in the PR, not a local file to read. `--line` is a positive,
@@ -79,10 +82,14 @@ one-based diff line number. The new side is the default; use `--side old` for
 removed lines. General comments omit both flags. `--body-file` preserves Markdown
 and newlines; `-` reads stdin. Empty bodies and incompatible options are rejected.
 
-Creation sends `pending: true`. Publication first reads the selected comment,
-then updates only `pending: false`, preserving content and anchors. An already
-published comment is left alone. Deleted comments or unknown pending state are
-rejected. There is no publish-all operation, approval, or automatic review submission.
+Creation sends `pending: true` unless `--publish` is given; then `pending` is
+omitted and Bitbucket creates a published comment. Bitbucket rejects any change
+to `pending` on PUT (`pending: extra keys not allowed`), so publication reads the
+draft, re-creates it as published with the same text, inline anchor and parent,
+and then deletes the draft. The published comment gets a new ID, which is printed.
+If deleting the draft fails, the error names both IDs. An already published
+comment is left alone. Deleted comments or unknown pending state are rejected.
+There is no publish-all operation, approval, or automatic review submission.
 
 Updates accept exactly one of `--body` or `--body-file` (including `-` for stdin).
 They read the current comment, then send only the replacement `content.raw`.
@@ -96,14 +103,11 @@ Updates are read-then-write, not atomic against concurrent edits/publication;
 avoid editing the same comment from multiple sessions at once.
 
 **Important:** the [API documentation](https://developer.atlassian.com/cloud/bitbucket/rest/api-group-pullrequests/)
-includes `pending` in comment POST/PUT schemas, but does not explain publication
-semantics or document a batch publish-review endpoint. An authorized live creation
-probe was rejected with HTTP 400 and `fields: {"type":"extra keys not allowed"}`.
-After omitting `type`, a second authorized probe succeeded; creation, read-back,
-and listing confirmed `pending: true`. **Updates, publication, and visibility to
-other users are not yet live-verified.** Verify those on a test PR before relying
-on them. Listing filters the comments the API returns; it does not guarantee every
-web-UI draft is exposed.
+includes `pending` in comment POST/PUT schemas, but does not document publication
+or a batch publish-review endpoint. Live behavior: POST rejects `type`
+(`extra keys not allowed`); POST with `pending: true` creates a draft; POST without
+`pending` creates a published comment; PUT rejects `pending`. Listing filters the
+comments the API returns; it does not guarantee every web-UI draft is exposed.
 
 The CLI requires the expected pending state in write responses before reporting
 success. If Bitbucket ignores pending on creation, the comment may already be
@@ -113,6 +117,20 @@ retrying creation. Writes are never automatically retried or deleted.
 The current comment POST/PUT documentation lists `read:pullrequest:bitbucket` for
 API tokens, even though these are writes. Broader future approval/request-changes
 workflows require `write:pullrequest:bitbucket` as well.
+
+### Filtering comments
+
+```sh
+# Comments in threads that are still open, including their replies.
+bb pr comments 123 --unresolved
+
+# Comments by one reviewer: display name or nickname substring, or exact account id/uuid.
+bb pr comments 123 --author nemanja --unresolved --json
+```
+
+The comment list always returns `resolution: null`, so `bb pr comments` reads each
+thread's top-level comment to report real resolved status (one request per thread).
+`--pending` lists drafts only and skips these lookups.
 
 ### Threads: replies, resolve, reopen
 
