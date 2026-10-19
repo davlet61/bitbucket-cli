@@ -33,7 +33,7 @@ Usage:
       [--description <text>]
   bb repo view [workspace/repo]
   bb pr list [--state OPEN|MERGED|DECLINED|SUPERSEDED]
-  bb pr create --title <text> [--source <branch>] [--destination <branch>]
+  bb pr create --title <text> [--source <branch>] [--destination <branch>] [--draft]
       [--description <text> | --description-file <path|->]
   bb pr update <id> [--title <text>] [--destination <branch>]
       [--description <text> | --description-file <path|->]
@@ -56,6 +56,7 @@ Without --project, Bitbucket assigns the oldest project in the workspace.
 
 PR creation defaults to the current Git branch and targets the repository's
 main branch unless --destination is given. Push the source branch first.
+Use --draft to create a draft PR; the response must confirm draft status.
 PR updates send only supplied fields; --description '' clears the description.
 pr open launches the PR in your system browser.
 
@@ -89,7 +90,7 @@ function print(value: string) {
 }
 
 function headline(pr: Pullrequest) {
-  return `#${pr.id ?? '?'}  ${pr.state ?? ''}  ${pr.title ?? ''}`;
+  return `#${pr.id ?? '?'}  ${pr.state ?? ''}${pr.draft === true ? ' [draft]' : ''}  ${pr.title ?? ''}`;
 }
 
 function formatComment(comment: ReviewComment) {
@@ -115,6 +116,7 @@ export async function main(args = process.argv.slice(2)) {
       title: { type: 'string' },
       source: { type: 'string' },
       destination: { type: 'string' },
+      draft: { type: 'boolean' },
       state: { type: 'string' },
       body: { type: 'string' },
       'body-file': { type: 'string' },
@@ -163,6 +165,9 @@ export async function main(args = process.argv.slice(2)) {
     return;
   }
   const writesPr = resource === 'pr' && (command === 'create' || command === 'update');
+  if (values.draft !== undefined && !(resource === 'pr' && command === 'create')) {
+    throw new Error('--draft is only supported by pr create.');
+  }
   for (const flag of creationFlags) {
     if (flag === 'description' && writesPr) continue;
     if (values[flag] !== undefined) throw new Error(`--${flag} is only supported by ${flag === 'description' ? 'repo create, pr create, or pr update' : 'repo create'}.`);
@@ -171,7 +176,7 @@ export async function main(args = process.argv.slice(2)) {
     if (values[flag] !== undefined && !writesPr) throw new Error(`--${flag} is only supported by pr create or update.`);
   }
   if (writesPr) {
-    const allowed = new Set(['repo', 'json', 'title', 'source', 'destination', 'description', 'description-file']);
+    const allowed = new Set(['repo', 'json', 'title', 'source', 'destination', 'description', 'description-file', 'draft']);
     for (const flag of Object.keys(values)) {
       if (!allowed.has(flag)) throw new Error(`--${flag} is not supported by pr ${command}.`);
     }

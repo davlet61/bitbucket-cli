@@ -34,7 +34,7 @@ bb repo create <workspace/repo> [--private | --public] [--project KEY]
     [--description <text>]
 bb repo view [workspace/repo]
 bb pr list [--state OPEN|MERGED|DECLINED|SUPERSEDED]
-bb pr create --title <text> [--source <branch>] [--destination <branch>]
+bb pr create --title <text> [--source <branch>] [--destination <branch>] [--draft]
     [--description <text> | --description-file <path|->]
 bb pr update <id> [--title <text>] [--destination <branch>]
     [--description <text> | --description-file <path|->]
@@ -68,6 +68,7 @@ Requests have a 30-second timeout per request; rate-limit errors report
 ```sh
 # Push the source branch before creating the PR.
 bb pr create --title 'Handle empty results' --description-file description.md
+bb pr create --draft --title 'Work in progress' --description-file description.md
 bb pr create -R workspace/repository --source feature --destination main \
   --title 'Handle empty results' --description 'Return an empty list.' --json
 
@@ -85,6 +86,13 @@ outside a Git checkout or with a detached HEAD, supply it explicitly. Without
 `--destination`, Bitbucket chooses the repository's main branch. These commands
 do not push commits. Source and destination refer to branches in the selected
 repository; cross-repository PR creation is not currently exposed.
+
+Use `--draft` on `pr create` to create a draft PR. The API response must confirm
+`draft: true` before success is reported; an unconfirmed write may already have
+created a PR, so inspect it before retrying. Without `--draft`, the draft field is
+omitted and Bitbucket uses its normal creation default. Human output marks draft
+PRs with `[draft]`; JSON preserves the API's `draft` field. The flag is only
+supported for creation.
 
 Updates accept a title, description, or destination branch and send only supplied
 fields. `--description-file` preserves Markdown and newlines; `-` reads stdin.

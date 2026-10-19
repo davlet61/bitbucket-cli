@@ -67,6 +67,53 @@ describe('PR creation and updates', () => {
     expect(log.mock.calls[0]?.[0]).toContain('/pull-requests/42');
   });
 
+  test.each([false, true])('creates a draft through the generated SDK (json=%s)', async (json) => {
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    const network = respond(async (request) => {
+      expect(request.url).toBe(collection);
+      expect(request.method).toBe('POST');
+      expect(await request.json()).toEqual({ title: 'Feature', source: pr.source, description: 'Still in progress.', draft: true });
+      return Response.json({ ...pr, description: 'Still in progress.', draft: true }, { status: 201 });
+    });
+    await main(['pr', 'create', '-R', 'team/project', '--title', 'Feature', '--source', 'feature', '--description', 'Still in progress.', '--draft', ...(json ? ['--json'] : [])]);
+    if (json) expect(JSON.parse(log.mock.calls[0]?.[0]).draft).toBe(true);
+    else expect(log.mock.calls[0]?.[0]).toContain('Created #42  OPEN [draft]  Feature');
+    expect(network).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([false, undefined])('rejects an unconfirmed draft response without retrying (draft=%s)', async (draft) => {
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    const network = respond(() => Response.json({ ...pr, draft }, { status: 201 }));
+    await expect(main(['pr', 'create', '-R', 'team/project', '--title', 'Feature', '--source', 'feature', '--draft']))
+      .rejects.toThrow('did not confirm');
+    expect(log).not.toHaveBeenCalled();
+    expect(network).toHaveBeenCalledTimes(1);
+  });
+
+  test('reports a failed draft POST without retrying', async () => {
+    const network = respond(() => Response.json({ error: { message: 'Draft creation denied' } }, { status: 403 }));
+    await expect(main(['pr', 'create', '-R', 'team/project', '--title', 'Feature', '--source', 'feature', '--draft']))
+      .rejects.toThrow('Not retried; inspect the PR');
+    expect(network).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([
+    ['pr', 'update', '42', '--title', 'Feature'], ['pr', 'list'], ['pr', 'view', '42'],
+    ['pr', 'open', '42'], ['pr', 'comment', 'add', '42', '--body', 'Text'],
+    ['repo', 'create'], ['repo', 'view'],
+  ].map((args) => ({ args })))('rejects --draft outside pr create: %j', async ({ args }) => {
+    const network = respond(() => { throw new Error('Unexpected request'); });
+    await expect(main([...args, '-R', 'team/project', '--draft'])).rejects.toThrow('--draft');
+    expect(network).not.toHaveBeenCalled();
+  });
+
+  test.each(['list', 'view'])('marks draft PRs in %s output', async (command) => {
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    respond(() => Response.json(command === 'list' ? { values: [{ ...pr, draft: true }] } : { ...pr, draft: true }));
+    await main(['pr', command, ...(command === 'view' ? ['42'] : []), '-R', 'team/project']);
+    expect(log.mock.calls[0]?.[0]).toContain('#42  OPEN [draft]  Feature');
+  });
+
   test.each([
     ['--description', 'Replacement'], ['--description', ''], ['--title', 'New title'], ['--destination', 'release'],
   ])('updates only the supplied field: %s %s', async (flag, value) => {

@@ -8,8 +8,8 @@ import {
 } from './generated/sdk.gen.ts';
 
 type RepositoryPath = { workspace: string; repo_slug: string };
-type Input = { title?: string; source?: string; destination?: string; description?: string; 'description-file'?: string };
-type Changes = { title?: string; description?: string; source?: { branch: { name: string } }; destination?: { branch: { name: string } } };
+type Input = { title?: string; source?: string; destination?: string; description?: string; 'description-file'?: string; draft?: boolean };
+type Changes = { title?: string; description?: string; source?: { branch: { name: string } }; destination?: { branch: { name: string } }; draft?: true };
 
 export function currentBranch(): string {
   try {
@@ -25,6 +25,7 @@ export async function pullrequestChanges(input: Input, creating: boolean): Promi
   }
   if (creating && input.title === undefined) throw new Error('PR creation requires --title.');
   if (!creating && input.source !== undefined) throw new Error('--source is only supported by pr create.');
+  if (!creating && input.draft !== undefined) throw new Error('--draft is only supported by pr create.');
   if (input.description !== undefined && input['description-file'] !== undefined) {
     throw new Error('Supply either --description or --description-file, not both.');
   }
@@ -33,6 +34,7 @@ export async function pullrequestChanges(input: Input, creating: boolean): Promi
   const source = creating ? input.source ?? currentBranch() : undefined;
   if (source !== undefined && source === input.destination) throw new Error('Source and destination branches must differ.');
   const changes: Changes = {
+    ...(input.draft ? { draft: true as const } : {}),
     ...(input.title !== undefined ? { title: input.title } : {}),
     ...(description !== undefined ? { description } : {}),
     ...(source !== undefined ? { source: { branch: { name: source } } } : {}),
@@ -56,6 +58,7 @@ export async function writePullrequest(client: Client, repository: RepositoryPat
   }
   if (!Number.isSafeInteger(data?.id) || data.id! <= 0 || (id !== undefined && data.id !== id) ||
       data.state !== 'OPEN' ||
+      (changes.draft !== undefined && data.draft !== changes.draft) ||
       (changes.title !== undefined && data.title !== changes.title) ||
       (changes.description !== undefined && (data.description ?? data.summary?.raw) !== changes.description) ||
       (changes.source !== undefined && data.source?.branch?.name !== changes.source.branch.name) ||
