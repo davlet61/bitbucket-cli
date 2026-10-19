@@ -3,6 +3,7 @@ import { parseArgs, stripVTControlCharacters } from 'node:util';
 import { collectPages, createBitbucketClient } from './api.ts';
 import { resolveRepository } from './config.ts';
 import { createRepository } from './repositories.ts';
+import { openPullrequest, pullrequestChanges, writePullrequest } from './pullrequests.ts';
 import {
   addComment,
   commentBody,
@@ -32,6 +33,11 @@ Usage:
       [--description <text>]
   bb repo view [workspace/repo]
   bb pr list [--state OPEN|MERGED|DECLINED|SUPERSEDED]
+  bb pr create --title <text> [--source <branch>] [--destination <branch>]
+      [--description <text> | --description-file <path|->]
+  bb pr update <id> [--title <text>] [--destination <branch>]
+      [--description <text> | --description-file <path|->]
+  bb pr open <id>
   bb pr view <id>
   bb pr diff <id>
   bb pr comments <id> [--pending | --unresolved] [--author <name>]
@@ -47,6 +53,11 @@ Repository creation defaults to private; --public must be explicit.
 Creation requires an explicit workspace/repo (positional or --repo), refuses
 existing repositories, and does not clone, change Git remotes, or push.
 Without --project, Bitbucket assigns the oldest project in the workspace.
+
+PR creation defaults to the current Git branch and targets the repository's
+main branch unless --destination is given. Push the source branch first.
+PR updates send only supplied fields; --description '' clears the description.
+pr open launches the PR in your system browser.
 
 Comment creation defaults to pending; --publish posts it visibly right away.
 Publishing a pending comment re-creates it as published (new id) and deletes
@@ -100,6 +111,10 @@ export async function main(args = process.argv.slice(2)) {
       public: { type: 'boolean' },
       project: { type: 'string' },
       description: { type: 'string' },
+      'description-file': { type: 'string' },
+      title: { type: 'string' },
+      source: { type: 'string' },
+      destination: { type: 'string' },
       state: { type: 'string' },
       body: { type: 'string' },
       'body-file': { type: 'string' },
@@ -147,11 +162,30 @@ export async function main(args = process.argv.slice(2)) {
     ].filter(Boolean).join('\n'));
     return;
   }
+  const writesPr = resource === 'pr' && (command === 'create' || command === 'update');
   for (const flag of creationFlags) {
-    if (values[flag] !== undefined) throw new Error(`--${flag} is only supported by repo create.`);
+    if (flag === 'description' && writesPr) continue;
+    if (values[flag] !== undefined) throw new Error(`--${flag} is only supported by ${flag === 'description' ? 'repo create, pr create, or pr update' : 'repo create'}.`);
+  }
+  for (const flag of ['title', 'source', 'destination', 'description-file'] as const) {
+    if (values[flag] !== undefined && !writesPr) throw new Error(`--${flag} is only supported by pr create or update.`);
+  }
+  if (writesPr) {
+    const allowed = new Set(['repo', 'json', 'title', 'source', 'destination', 'description', 'description-file']);
+    for (const flag of Object.keys(values)) {
+      if (!allowed.has(flag)) throw new Error(`--${flag} is not supported by pr ${command}.`);
+    }
+    if (positionals.length !== (command === 'create' ? 2 : 3)) throw new Error('Unexpected or missing arguments. Run bb --help.');
+    const id = command === 'update' ? positiveId(positionals[2], 'PR id') : undefined;
+    const changes = await pullrequestChanges(values, command === 'create');
+    const repository = resolveRepository(values.repo);
+    const data = await writePullrequest(createBitbucketClient(), repository, changes, id);
+    if (values.json) console.log(JSON.stringify(data, null, 2));
+    else print([`${command === 'create' ? 'Created' : 'Updated'} ${headline(data)}`, data.links?.html?.href ?? ''].filter(Boolean).join('\n'));
+    return;
   }
   const action = command === 'comment' ? positionals[2] : undefined;
-  if (resource !== 'pr' || !['list', 'view', 'diff', 'comments', 'comment'].includes(command ?? '') ||
+  if (resource !== 'pr' || !['list', 'view', 'open', 'diff', 'comments', 'comment'].includes(command ?? '') ||
       (command === 'comment' && !['add', 'pending', 'publish', 'update', 'resolve', 'reopen'].includes(action ?? ''))) {
     throw new Error('Unknown command. Run bb --help.');
   }
@@ -185,6 +219,12 @@ export async function main(args = process.argv.slice(2)) {
   const updatedText = action === 'update' ? await readCommentBody(values) : undefined;
 
   const repository = resolveRepository(values.repo);
+  if (command === 'open') {
+    const url = openPullrequest(repository, id!);
+    if (values.json) console.log(JSON.stringify({ url }, null, 2));
+    else print(url);
+    return;
+  }
   const client = createBitbucketClient();
   const options = { client, throwOnError: true as const };
   const path = { ...repository, pull_request_id: Number(id) };
@@ -206,7 +246,7 @@ export async function main(args = process.argv.slice(2)) {
         `${data.source?.branch?.name ?? '?'} → ${data.destination?.branch?.name ?? '?'}`,
         data.links?.html?.href ?? '',
         '',
-        data.summary?.raw ?? '',
+        String(data.description ?? data.summary?.raw ?? ''),
       ].join('\n'));
       break;
     }

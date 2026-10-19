@@ -34,6 +34,11 @@ bb repo create <workspace/repo> [--private | --public] [--project KEY]
     [--description <text>]
 bb repo view [workspace/repo]
 bb pr list [--state OPEN|MERGED|DECLINED|SUPERSEDED]
+bb pr create --title <text> [--source <branch>] [--destination <branch>]
+    [--description <text> | --description-file <path|->]
+bb pr update <id> [--title <text>] [--destination <branch>]
+    [--description <text> | --description-file <path|->]
+bb pr open <id>
 bb pr view <id>
 bb pr diff <id>
 bb pr comments <id> [--pending | --unresolved] [--author <name>]
@@ -57,6 +62,47 @@ envelopes. JSON diffs are strings. Human output removes terminal escape sequence
 JSON preserves API data. Errors go to stderr with exit status 1.
 Requests have a 30-second timeout per request; rate-limit errors report
 `Retry-After` when present. There are no automatic retries.
+
+### Creating, updating, and opening PRs
+
+```sh
+# Push the source branch before creating the PR.
+bb pr create --title 'Handle empty results' --description-file description.md
+bb pr create -R workspace/repository --source feature --destination main \
+  --title 'Handle empty results' --description 'Return an empty list.' --json
+
+bb pr update 123 --description-file description.md
+printf '%s\n' '## Changes' '' '- Handle empty results' | bb pr update 123 --description-file -
+bb pr update 123 --title 'Handle empty results safely' --destination release
+bb pr update 123 --description ''
+
+# Open an existing PR in the system browser.
+bb pr open 123
+```
+
+Creation requires a title. `--source` defaults to the current Git branch;
+outside a Git checkout or with a detached HEAD, supply it explicitly. Without
+`--destination`, Bitbucket chooses the repository's main branch. These commands
+do not push commits. Source and destination refer to branches in the selected
+repository; cross-repository PR creation is not currently exposed.
+
+Updates accept a title, description, or destination branch and send only supplied
+fields. `--description-file` preserves Markdown and newlines; `-` reads stdin.
+An empty description clears the existing text. Bitbucket permits updates only
+while the PR is open. Concurrent edits to the same field can overwrite each other.
+
+Write responses must confirm the PR ID, open state, and requested fields before
+success is reported. Failed or ambiguous writes are never retried automatically;
+inspect the PR before retrying creation to avoid duplicates. These operations use
+the generated SDK and offline HTTP fixtures; they have not been live-verified.
+API tokens need `read:pullrequest:bitbucket` and `write:pullrequest:bitbucket`;
+OAuth/access tokens need corresponding PR write permissions. See the
+[Bitbucket PR API](https://developer.atlassian.com/cloud/bitbucket/rest/api-group-pullrequests/).
+
+`pr open` constructs the Bitbucket URL from the selected repository and PR ID;
+it does not query the API or check whether the PR exists. It uses `xdg-open` on
+Linux, `open` on macOS, or the Windows URL handler. `--json` returns `{ "url": … }`
+after launching the browser. If launch fails, the error includes the URL.
 
 ### Repositories
 
@@ -223,6 +269,7 @@ bun run build       # Optional standalone binary; not needed for development
 - `src/api.ts`: client configuration, errors, and guarded pagination.
 - `src/comments.ts`: comment input validation, pending creation, text updates, and publication.
 - `src/repositories.ts`: private-by-default creation, existing-repository guard, and write-response checks.
+- `src/pullrequests.ts`: PR creation, field updates, branch inference, and browser opening.
 - `src/cli.ts`: argument handling, SDK calls, and output.
 - `tests/cli.test.ts`: offline checks through the actual generated SDK with mocked HTTP.
 

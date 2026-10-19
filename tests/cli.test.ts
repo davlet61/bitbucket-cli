@@ -2,6 +2,9 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import * as childProcess from 'node:child_process';
+import { openPullrequest } from '../src/pullrequests.ts';
 import { commentBody } from '../src/comments.ts';
 import { createBitbucketClient, collectPages } from '../src/api.ts';
 import { main } from '../src/cli.ts';
@@ -33,6 +36,148 @@ function respond(handler: (request: Request) => Response | Promise<Response>) {
 }
 
 const collection = 'https://api.bitbucket.org/2.0/repositories/team/project/pullrequests';
+
+describe('PR creation and updates', () => {
+  const pr = { id: 42, state: 'OPEN', title: 'Feature', source: { branch: { name: 'feature' } }, destination: { branch: { name: 'main' } } };
+
+  test('creates a PR with the requested branches and Markdown description', async () => {
+    process.env.BITBUCKET_ACCESS_TOKEN = 'test-token';
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    const network = respond(async (request) => {
+      expect(request.url).toBe(collection);
+      expect(request.method).toBe('POST');
+      expect(request.headers.get('Authorization')).toBe('Bearer test-token');
+      const body = await request.json();
+      expect(body).toEqual({ title: 'Feature', source: pr.source, destination: pr.destination, description: '## Details\n\nA change.\n' });
+      return Response.json({ ...pr, ...body }, { status: 201 });
+    });
+    await main(['pr', 'create', '-R', 'team/project', '--title', 'Feature', '--source', 'feature', '--destination', 'main', '--description', '## Details\n\nA change.\n', '--json']);
+    expect(JSON.parse(log.mock.calls[0]?.[0]).id).toBe(42);
+    expect(network).toHaveBeenCalledTimes(1);
+  });
+
+  test('omits unspecified creation fields so Bitbucket chooses the destination', async () => {
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    respond(async (request) => {
+      expect(await request.json()).toEqual({ title: 'Feature', source: pr.source });
+      return Response.json({ ...pr, links: { html: { href: 'https://bitbucket.org/team/project/pull-requests/42' } } });
+    });
+    await main(['pr', 'create', '-R', 'team/project', '--title', 'Feature', '--source', 'feature']);
+    expect(log.mock.calls[0]?.[0]).toContain('Created #42  OPEN  Feature');
+    expect(log.mock.calls[0]?.[0]).toContain('/pull-requests/42');
+  });
+
+  test.each([
+    ['--description', 'Replacement'], ['--description', ''], ['--title', 'New title'], ['--destination', 'release'],
+  ])('updates only the supplied field: %s %s', async (flag, value) => {
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    const expected = flag === '--destination' ? { destination: { branch: { name: value } } } : { [flag.slice(2)]: value };
+    const network = respond(async (request) => {
+      expect(request.url).toBe(`${collection}/42`);
+      expect(request.method).toBe('PUT');
+      expect(await request.json()).toEqual(expected);
+      return Response.json({ ...pr, ...expected });
+    });
+    await main(['pr', 'update', '42', '-R', 'team/project', flag, value, '--json']);
+    expect(JSON.parse(log.mock.calls[0]?.[0])).toMatchObject(expected);
+    expect(network).toHaveBeenCalledTimes(1);
+  });
+
+  test('reads descriptions from a file and stdin, preserving newlines', async () => {
+    spyOn(console, 'log').mockImplementation(() => {});
+    const dir = await mkdtemp(join(tmpdir(), 'bb-description-'));
+    const markdown = '# Details\n\n- First\n- Second\n';
+    const stdin = spyOn(Bun.stdin, 'text').mockResolvedValue(markdown);
+    try {
+      const file = join(dir, 'description.md');
+      await writeFile(file, markdown);
+      respond(async (request) => {
+        expect(await request.json()).toEqual({ description: markdown });
+        // Some API responses expose the description as summary.raw.
+        return Response.json({ ...pr, summary: { raw: markdown } });
+      });
+      for (const path of [file, '-']) await main(['pr', 'update', '42', '-R', 'team/project', '--description-file', path]);
+      expect(stdin).toHaveBeenCalledTimes(1);
+    } finally {
+      stdin.mockRestore();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('rejects invalid arguments before requests', async () => {
+    const network = respond(() => { throw new Error('Unexpected request'); });
+    for (const args of [
+      ['create'], ['create', '--title', ' '], ['create', '--title', 'X', '--source', ' '],
+      ['create', '--title', 'X', '--source', 'main', '--destination', 'main'],
+      ['create', '42', '--title', 'X'], ['create', '--title', 'X', '--pending'],
+      ['update', '42'], ['update', '0', '--title', 'X'], ['update', '42', '--title', ' '],
+      ['update', '42', '--source', 'feature'], ['update', '42', '--destination', ' '],
+      ['update', '42', '--description', 'X', '--description-file', '-'],
+      ['update', '42', '--body', 'X'], ['list', '--description-file', '-'], ['open', '0'], ['open', '42', '--title', 'X'],
+    ]) await expect(main(['pr', ...args, '-R', 'team/project'])).rejects.toThrow();
+    expect(network).not.toHaveBeenCalled();
+  });
+
+  test.each(['create', 'update'])('never retries a failed %s request', async (command) => {
+    const network = respond(() => Response.json({ error: { message: 'Denied' } }, { status: 403 }));
+    await expect(main(['pr', command, ...(command === 'update' ? ['42'] : ['--source', 'feature']), '-R', 'team/project', '--title', 'Feature']))
+      .rejects.toThrow('Not retried; inspect the PR');
+    expect(network).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([
+    {}, { id: 0 }, { state: 'MERGED' }, { title: 'Ignored' }, { source: { branch: { name: 'wrong' } } },
+  ])('does not report unconfirmed creation as success: %j', async (override) => {
+    const network = respond(() => Response.json(Object.keys(override).length ? { ...pr, ...override } : {}));
+    await expect(main(['pr', 'create', '-R', 'team/project', '--title', 'Feature', '--source', 'feature'])).rejects.toThrow('did not confirm');
+    expect(network).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([{ id: 43 }, { description: 'Ignored' }, { state: 'DECLINED' }])('does not report unconfirmed updates as success: %j', async (override) => {
+    respond(() => Response.json({ ...pr, description: 'Replacement', ...override }));
+    await expect(main(['pr', 'update', '42', '-R', 'team/project', '--description', 'Replacement'])).rejects.toThrow('did not confirm');
+  });
+
+  test('finds the current branch and rejects a detached HEAD', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'bb-branch-'));
+    const code = `import { currentBranch } from ${JSON.stringify(new URL('../src/pullrequests.ts', import.meta.url).pathname)}; console.log(currentBranch());`;
+    try {
+      execFileSync('git', ['init', '--quiet', '--initial-branch=feature'], { cwd: dir });
+      expect(execFileSync(process.execPath, ['-e', code], { cwd: dir, encoding: 'utf8' }).trim()).toBe('feature');
+      await writeFile(join(dir, '.git', 'HEAD'), '0123456789012345678901234567890123456789\n');
+      expect(() => execFileSync(process.execPath, ['-e', code], { cwd: dir, stdio: 'pipe' })).toThrow();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test.each(['linux', 'darwin', 'win32'] as const)('opens the canonical URL without a shell on %s', (platform) => {
+    const calls: unknown[][] = [];
+    const run = ((...args: unknown[]) => { calls.push(args); }) as unknown as typeof execFileSync;
+    expect(openPullrequest({ workspace: 'team', repo_slug: 'project' }, 42, run, platform)).toBe('https://bitbucket.org/team/project/pull-requests/42');
+    expect(calls).toEqual([[platform === 'darwin' ? 'open' : platform === 'win32' ? 'rundll32.exe' : 'xdg-open',
+      [...(platform === 'win32' ? ['url.dll,FileProtocolHandler'] : []), 'https://bitbucket.org/team/project/pull-requests/42'], { stdio: 'ignore' }]]);
+  });
+
+  test('reports the PR URL when browser launch fails', () => {
+    const run = (() => { throw new Error('Unavailable'); }) as unknown as typeof execFileSync;
+    expect(() => openPullrequest({ workspace: 'team', repo_slug: 'project' }, 42, run)).toThrow('Open https://bitbucket.org/team/project/pull-requests/42');
+  });
+
+  test('pr open launches the browser and prints JSON without an API request', async () => {
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    const network = respond(() => { throw new Error('Unexpected request'); });
+    const opener = spyOn(childProcess, 'execFileSync').mockReturnValue(Buffer.alloc(0));
+    try {
+      await main(['pr', 'open', '42', '-R', 'team/project', '--json']);
+      expect(JSON.parse(log.mock.calls[0]?.[0])).toEqual({ url: 'https://bitbucket.org/team/project/pull-requests/42' });
+      expect(opener).toHaveBeenCalledTimes(1);
+      expect(network).not.toHaveBeenCalled();
+    } finally {
+      opener.mockRestore();
+    }
+  });
+});
 
 describe('configuration', () => {
   test('supports API tokens and bearer tokens without silently mixing credentials', () => {
