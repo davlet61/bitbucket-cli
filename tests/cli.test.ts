@@ -129,6 +129,105 @@ describe('CLI through the generated SDK', () => {
   });
 });
 
+describe('repository commands', () => {
+  const endpoint = 'https://api.bitbucket.org/2.0/repositories/team/project';
+  const repository = { uuid: '{repo-id}', full_name: 'team/project', scm: 'git', is_private: true };
+
+  test.each([undefined, '--private', '--public'])('creates with explicit privacy in the API body (%s)', async (visibility) => {
+    process.env.BITBUCKET_ACCESS_TOKEN = 'test-token';
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    const methods: string[] = [];
+    respond(async (request) => {
+      methods.push(request.method);
+      expect(request.url).toBe(endpoint);
+      expect(request.headers.get('Authorization')).toBe('Bearer test-token');
+      if (request.method === 'GET') return Response.json({ error: { message: 'Not found' } }, { status: 404 });
+      const body = await request.json();
+      expect(body).toEqual({ scm: 'git', name: 'project', is_private: visibility !== '--public', project: { key: 'PVT' }, description: 'PVT monorepo' });
+      return Response.json({ ...repository, ...body });
+    });
+    await main(['repo', 'create', 'team/project', '--project', 'PVT', '--description', 'PVT monorepo', '--json', ...(visibility ? [visibility] : [])]);
+    expect(methods).toEqual(['GET', 'POST']);
+    expect(JSON.parse(log.mock.calls[0]?.[0]).is_private).toBe(visibility !== '--public');
+  });
+
+  test('supports --repo and omits unspecified project and description', async () => {
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    respond(async (request) => {
+      if (request.method === 'GET') return new Response(null, { status: 404 });
+      expect(await request.json()).toEqual({ scm: 'git', name: 'project', is_private: true });
+      return Response.json(repository);
+    });
+    await main(['repo', 'create', '-R', 'team/project']);
+    expect(log.mock.calls[0]?.[0]).toBe('Created team/project (private)');
+  });
+
+  test.each([200, 401, 403, 500])('does not write when preflight returns %s', async (status) => {
+    const network = respond((request) => {
+      expect(request.method).toBe('GET');
+      return Response.json(status === 200 ? repository : { error: { message: 'Denied' } }, { status });
+    });
+    await expect(main(['repo', 'create', 'team/project'])).rejects.toThrow(status === 200 ? 'already exists' : `HTTP ${status}`);
+    expect(network).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([
+    { is_private: false }, { is_private: undefined }, { uuid: undefined },
+    { full_name: 'team/other' }, { scm: 'hg' }, { project: { key: 'OTHER' } },
+    { description: 'different' },
+  ])('rejects unconfirmed creation settings without cleanup or retries: %j', async (override) => {
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    const methods: string[] = [];
+    respond((request) => {
+      methods.push(request.method);
+      if (request.method === 'GET') return new Response(null, { status: 404 });
+      return Response.json({ ...repository, project: { key: 'PVT' }, description: 'PVT', ...override });
+    });
+    await expect(main(['repo', 'create', 'team/project', '--project', 'PVT', '--description', 'PVT'])).rejects.toThrow('did not confirm');
+    expect(methods).toEqual(['GET', 'POST']);
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  test.each([409, 429, 500, 'timeout'])('never retries a failed creation: %s', async (failure) => {
+    const network = respond((request) => {
+      if (request.method === 'GET') return new Response(null, { status: 404 });
+      if (failure === 'timeout') throw new Error('Timed out');
+      return Response.json({ error: { message: 'Creation failed' } }, { status: failure as number });
+    });
+    await expect(main(['repo', 'create', 'team/project'])).rejects.toThrow('Not retried; inspect team/project');
+    expect(network).toHaveBeenCalledTimes(2);
+  });
+
+  test('views a repository without writing', async () => {
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    const network = respond((request) => {
+      expect(request.method).toBe('GET');
+      expect(request.url).toBe(endpoint);
+      return Response.json(repository);
+    });
+    await main(['repo', 'view', 'team/project', '--json']);
+    expect(JSON.parse(log.mock.calls[0]?.[0])).toEqual(repository);
+    expect(network).toHaveBeenCalledTimes(1);
+  });
+
+  test('rejects missing targets, conflicting options and PR-only flags before requests', async () => {
+    const network = respond(() => { throw new Error('Unexpected request'); });
+    for (const args of [
+      ['repo', 'create'], ['repo', 'delete', 'team/project'],
+      ['repo', 'create', 'team/..'], ['repo', 'create', 'team/project', 'extra'],
+      ['repo', 'create', 'team/project', '-R', 'team/other'],
+      ['repo', 'create', 'team/project', '--private', '--public'],
+      ['repo', 'create', 'team/project', '--project', ' '],
+      ['repo', 'create', 'team/project', '--state', 'OPEN'],
+      ['repo', 'create', 'team/project', '--publish'],
+      ['repo', 'view', 'team/project', '--public'],
+      ['repo', 'view', 'team/project', '--description', 'x'],
+      ['pr', 'list', '--public'], ['pr', 'list', '--project', 'PVT'],
+    ]) await expect(main(args)).rejects.toThrow();
+    expect(network).not.toHaveBeenCalled();
+  });
+});
+
 describe('pending comment workflow', () => {
   test('omits the type discriminator rejected by the live comment endpoint', async () => {
     const log = spyOn(console, 'log').mockImplementation(() => {});

@@ -1,6 +1,6 @@
 # Bitbucket CLI
 
-Local Bitbucket Cloud PR CLI. Bun + TypeScript, with a Hey API-generated fetch SDK.
+Local Bitbucket Cloud repository and PR CLI. Bun + TypeScript, with a Hey API-generated fetch SDK.
 No runtime dependencies, database, or background service.
 
 ## Start
@@ -30,6 +30,9 @@ credentials in the calling shell; the CLI does not maintain a credential store.
 ## Commands
 
 ```text
+bb repo create <workspace/repo> [--private | --public] [--project KEY]
+    [--description <text>]
+bb repo view [workspace/repo]
 bb pr list [--state OPEN|MERGED|DECLINED|SUPERSEDED]
 bb pr view <id>
 bb pr diff <id>
@@ -44,7 +47,9 @@ bb pr comment reopen <id> <comment-id>
 ```
 
 All commands accept `--repo` / `-R workspace/repository` and `--json`.
-Without `--repo`, the repository is inferred from the current Git `origin`
+Repository commands also accept a positional `workspace/repository`, but not
+alongside `--repo`. Repository creation always requires an explicit target. For read/PR
+commands without an explicit target, the repository is inferred from Git `origin`
 (HTTPS, SCP-style SSH, or SSH URL on bitbucket.org).
 
 Lists default to `OPEN` and follow all pages. JSON lists are arrays, not page
@@ -52,6 +57,37 @@ envelopes. JSON diffs are strings. Human output removes terminal escape sequence
 JSON preserves API data. Errors go to stderr with exit status 1.
 Requests have a 30-second timeout per request; rate-limit errors report
 `Retry-After` when present. There are no automatic retries.
+
+### Repositories
+
+```sh
+bb repo create workspace/new-repository --private --project PROJECT_KEY
+bb repo view workspace/new-repository --json
+```
+
+Creation defaults to **private**; publishing a public repository requires
+`--public`. `--description` sets an optional description. `--project` accepts
+a project key or UUID; without it, Bitbucket assigns the workspace's oldest
+project. No project is created automatically by this CLI.
+
+The target is checked first: an existing repository is never changed, and only
+an HTTP 404 permits the creation request. A 404 can also hide an inaccessible
+repository; any subsequent creation failure is reported without retrying. The
+response must confirm the repository identity, Git SCM, privacy, and any supplied
+project/description. On an error or unconfirmed response, inspect with `repo view`
+before retrying: creation may already have succeeded. No automatic deletion or
+visibility change is attempted.
+
+These commands do not clone, initialize Git, change remotes, push commits, or
+rename local directories. Repository creation requires repository administration
+permission (`admin:repository:bitbucket` for API tokens); the preflight and view
+also require repository read access. A repository-scoped token generally cannot
+create a different repository. Use appropriately authorized account/workspace
+credentials without placing them in arguments.
+
+Implementation uses the checked-in generated SDK and is covered by offline HTTP
+fixtures; repository creation has not yet been verified against a live workspace.
+[Bitbucket repository API](https://developer.atlassian.com/cloud/bitbucket/rest/api-group-repositories/#api-repositories-workspace-repo-slug-post).
 
 ### Pending and published comments
 
@@ -186,6 +222,7 @@ bun run build       # Optional standalone binary; not needed for development
 - `src/config.ts`: authentication and Git remote inference.
 - `src/api.ts`: client configuration, errors, and guarded pagination.
 - `src/comments.ts`: comment input validation, pending creation, text updates, and publication.
+- `src/repositories.ts`: private-by-default creation, existing-repository guard, and write-response checks.
 - `src/cli.ts`: argument handling, SDK calls, and output.
 - `tests/cli.test.ts`: offline checks through the actual generated SDK with mocked HTTP.
 

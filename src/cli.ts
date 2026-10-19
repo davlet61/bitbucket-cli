@@ -2,6 +2,7 @@
 import { parseArgs, stripVTControlCharacters } from 'node:util';
 import { collectPages, createBitbucketClient } from './api.ts';
 import { resolveRepository } from './config.ts';
+import { createRepository } from './repositories.ts';
 import {
   addComment,
   commentBody,
@@ -16,6 +17,7 @@ import {
   type ReviewComment,
 } from './comments.ts';
 import {
+  getRepositoriesByWorkspaceByRepoSlug as getRepository,
   getRepositoriesByWorkspaceByRepoSlugPullrequests as listPullrequests,
   getRepositoriesByWorkspaceByRepoSlugPullrequestsByPullRequestId as getPullrequest,
   getRepositoriesByWorkspaceByRepoSlugPullrequestsByPullRequestIdComments as listComments,
@@ -23,9 +25,12 @@ import {
 } from './generated/sdk.gen.ts';
 import type { Pullrequest } from './generated/types.gen.ts';
 
-const help = `bb — Bitbucket Cloud PR CLI
+const help = `bb — Bitbucket Cloud CLI
 
 Usage:
+  bb repo create <workspace/repo> [--private | --public] [--project KEY]
+      [--description <text>]
+  bb repo view [workspace/repo]
   bb pr list [--state OPEN|MERGED|DECLINED|SUPERSEDED]
   bb pr view <id>
   bb pr diff <id>
@@ -37,6 +42,11 @@ Usage:
   bb pr comment publish <id> <comment-id>
   bb pr comment resolve <id> <comment-id>
   bb pr comment reopen <id> <comment-id>
+
+Repository creation defaults to private; --public must be explicit.
+Creation requires an explicit workspace/repo (positional or --repo), refuses
+existing repositories, and does not clone, change Git remotes, or push.
+Without --project, Bitbucket assigns the oldest project in the workspace.
 
 Comment creation defaults to pending; --publish posts it visibly right away.
 Publishing a pending comment re-creates it as published (new id) and deletes
@@ -86,6 +96,10 @@ export async function main(args = process.argv.slice(2)) {
     strict: true,
     options: {
       repo: { type: 'string', short: 'R' },
+      private: { type: 'boolean' },
+      public: { type: 'boolean' },
+      project: { type: 'string' },
+      description: { type: 'string' },
       state: { type: 'string' },
       body: { type: 'string' },
       'body-file': { type: 'string' },
@@ -106,6 +120,36 @@ export async function main(args = process.argv.slice(2)) {
     return;
   }
   const [resource, command] = positionals;
+  const creationFlags = ['private', 'public', 'project', 'description'] as const;
+  if (resource === 'repo') {
+    if (!['create', 'view'].includes(command ?? '')) throw new Error('Unknown command. Run bb --help.');
+    if (positionals.length > 3 || (positionals[2] !== undefined && values.repo !== undefined)) {
+      throw new Error('Supply one workspace/repo, positional or --repo.');
+    }
+    const allowed = new Set(['repo', 'json', ...(command === 'create' ? creationFlags : [])]);
+    for (const flag of Object.keys(values)) {
+      if (!allowed.has(flag)) throw new Error(`--${flag} is not supported by repo ${command}.`);
+    }
+    if (values.private && values.public) throw new Error('Use either --private or --public, not both.');
+    if (values.project !== undefined && !values.project.trim()) throw new Error('--project must not be empty.');
+    const explicit = positionals[2] ?? values.repo;
+    if (command === 'create' && explicit === undefined) throw new Error('Repository creation requires an explicit workspace/repo.');
+    const path = resolveRepository(explicit);
+    const client = createBitbucketClient();
+    const data = command === 'create'
+      ? await createRepository(client, path, { isPrivate: !values.public, project: values.project, description: values.description })
+      : (await getRepository({ client, path, throwOnError: true })).data;
+    if (values.json) console.log(JSON.stringify(data, null, 2));
+    else print([
+      `${command === 'create' ? 'Created ' : ''}${data.full_name ?? `${path.workspace}/${path.repo_slug}`} (${data.is_private === true ? 'private' : data.is_private === false ? 'public' : 'unknown visibility'})`,
+      data.links?.html?.href ?? '',
+      ...(data.links?.clone ?? []).map((link) => `${link.name ?? 'clone'}: ${link.href ?? ''}`),
+    ].filter(Boolean).join('\n'));
+    return;
+  }
+  for (const flag of creationFlags) {
+    if (values[flag] !== undefined) throw new Error(`--${flag} is only supported by repo create.`);
+  }
   const action = command === 'comment' ? positionals[2] : undefined;
   if (resource !== 'pr' || !['list', 'view', 'diff', 'comments', 'comment'].includes(command ?? '') ||
       (command === 'comment' && !['add', 'pending', 'publish', 'update', 'resolve', 'reopen'].includes(action ?? ''))) {
