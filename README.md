@@ -74,7 +74,8 @@ Requests have a 30-second timeout per request; rate-limit errors report
 ### Current user and PR lists
 
 `bb whoami` prints the authenticated user's display name, nickname, account id,
-and uuid (`--json` returns the full `/user` response).
+and uuid (`--json` returns the full `/user` response). It and `me` filters need
+the `read:user:bitbucket` API token scope.
 
 `bb pr list` requests `fields=+values.reviewers,+values.participants`, so each
 listed PR includes `reviewers` and `participants` (with `approved` and `state`).
