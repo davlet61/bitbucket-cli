@@ -24,7 +24,7 @@ export function parseRepository(value: string) {
 }
 
 export function repositoryFromRemote(remote: string) {
-  const match = /^(?:git@bitbucket\.org:|ssh:\/\/git@bitbucket\.org\/|https:\/\/(?:[^/@]+@)?bitbucket\.org\/)([^?#]+)$/.exec(remote.trim());
+  const match = /^(?:git@(?:ssh\.)?bitbucket\.org:|ssh:\/\/git@(?:ssh\.)?bitbucket\.org\/|https:\/\/(?:[^/@]+@)?bitbucket\.org\/)([^?#]+)$/.exec(remote.trim());
   if (!match) throw new Error('Origin is not a Bitbucket Cloud remote; use --repo workspace/repo-slug.');
   return parseRepository(match[1]!.replace(/\/$/, '').replace(/\.git$/, ''));
 }

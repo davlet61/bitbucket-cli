@@ -247,8 +247,10 @@ describe('configuration', () => {
       'ssh://git@bitbucket.org/team/project.git',
       'https://bitbucket.org/team/project.git',
       'https://user@bitbucket.org/team/project',
+      'git@ssh.bitbucket.org:team/project.git',
+      'ssh://git@ssh.bitbucket.org/team/project.git',
     ]) expect(repositoryFromRemote(remote)).toEqual({ workspace: 'team', repo_slug: 'project' });
-    for (const remote of ['git@github.com:team/project.git', 'https://bitbucket.org.evil.test/team/project']) {
+    for (const remote of ['git@github.com:team/project.git', 'https://bitbucket.org.evil.test/team/project', 'git@ssh.bitbucket.org.evil.test:team/project.git', 'https://ssh.bitbucket.org/team/project']) {
       expect(() => repositoryFromRemote(remote)).toThrow('not a Bitbucket');
     }
     for (const repo of ['team/..', '../project', 'team/project/extra', 'team/project?q=bad']) {
@@ -277,8 +279,45 @@ describe('CLI through the generated SDK', () => {
       return Response.json({ values: [{ id: 2, title: 'Second' }] });
     });
     await main(['pr', 'list', '-R', 'team/project', '--json']);
-    expect(urls).toEqual([`${collection}?state=OPEN`, `${collection}?page=2&state=OPEN`]);
+    expect(urls).toEqual([`${collection}?state=OPEN&fields=%2Bvalues.reviewers%2C%2Bvalues.participants`, `${collection}?page=2&state=OPEN`]);
     expect(JSON.parse(log.mock.calls[0]?.[0])).toEqual([{ id: 1, title: 'First' }, { id: 2, title: 'Second' }]);
+  });
+
+  test('prints the authenticated user', async () => {
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    const user = { display_name: 'Dev One', nickname: 'dev', account_id: '123:abc', uuid: '{me}' };
+    respond((request) => {
+      expect(request.url).toBe('https://api.bitbucket.org/2.0/user');
+      return Response.json(user);
+    });
+    await main(['whoami']);
+    expect(log.mock.calls[0]?.[0]).toBe('display_name: Dev One\nnickname: dev\naccount_id: 123:abc\nuuid: {me}');
+    await main(['whoami', '--json']);
+    expect(JSON.parse(log.mock.calls[1]?.[0])).toEqual(user);
+    await expect(main(['whoami', '--repo', 'team/project'])).rejects.toThrow('not supported by whoami');
+    await expect(main(['whoami', 'extra'])).rejects.toThrow('Unexpected');
+  });
+
+  test('filters PR lists by current author and pending reviewer', async () => {
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    const me = { display_name: 'Dev One', uuid: '{me}' };
+    const other = { display_name: 'Other', uuid: '{other}' };
+    const prs = [
+      { id: 1, author: me, reviewers: [other], participants: [] },
+      { id: 2, author: other, reviewers: [me], participants: [{ user: me, role: 'REVIEWER', approved: false, state: null }] },
+      { id: 3, author: other, reviewers: [me], participants: [{ user: me, role: 'REVIEWER', approved: true, state: 'approved' }] },
+      { id: 4, author: other, reviewers: [me], participants: [{ user: me, role: 'REVIEWER', approved: false, state: 'changes_requested' }] },
+      { id: 5, author: other, reviewers: [], participants: [{ user: me, role: 'PARTICIPANT', approved: false, state: null }] },
+    ];
+    respond((request) => request.url === 'https://api.bitbucket.org/2.0/user'
+      ? Response.json(me)
+      : Response.json({ values: prs }));
+    await main(['pr', 'list', '-R', 'team/project', '--author', 'me', '--json']);
+    expect(JSON.parse(log.mock.calls[0]?.[0]).map((pr: { id: number }) => pr.id)).toEqual([1]);
+    await main(['pr', 'list', '-R', 'team/project', '--reviewer', 'me', '--json']);
+    expect(JSON.parse(log.mock.calls[1]?.[0]).map((pr: { id: number }) => pr.id)).toEqual([2]);
+    await main(['pr', 'list', '-R', 'team/project', '--author', 'other', '--json']);
+    expect(JSON.parse(log.mock.calls[2]?.[0]).map((pr: { id: number }) => pr.id)).toEqual([2, 3, 4, 5]);
   });
 
   test('views a PR and strips terminal escape sequences', async () => {
@@ -321,6 +360,8 @@ describe('CLI through the generated SDK', () => {
       ['pr', 'view', '1.5'], ['pr', 'view', '9007199254740992'],
       ['pr', 'list', 'extra'], ['pr', 'list', '--state', 'INVALID'],
       ['pr', 'view', '42', '--state', 'OPEN'], ['pr', 'list', '--typo'],
+      ['pr', 'list', '--author', ' '], ['pr', 'view', '42', '--reviewer', 'me'],
+      ['pr', 'list', '--unresolved'],
     ]) await expect(main(args)).rejects.toThrow();
     expect(network).not.toHaveBeenCalled();
   });

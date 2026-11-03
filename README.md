@@ -33,10 +33,12 @@ overrides the stored login there. `bb auth status` shows which source is active.
 ## Commands
 
 ```text
+bb whoami
 bb repo create <workspace/repo> [--private | --public] [--project KEY]
     [--description <text>]
 bb repo view [workspace/repo]
-bb pr list [--state OPEN|MERGED|DECLINED|SUPERSEDED]
+bb pr list [--state OPEN|MERGED|DECLINED|SUPERSEDED] [--author <user>]
+    [--reviewer <user>]
 bb pr create --title <text> [--source <branch>] [--destination <branch>] [--draft]
     [--description <text> | --description-file <path|->]
 bb pr update <id> [--title <text>] [--destination <branch>]
@@ -61,13 +63,31 @@ All repository and PR commands accept `--repo` / `-R workspace/repository` and `
 Repository commands also accept a positional `workspace/repository`, but not
 alongside `--repo`. Repository creation always requires an explicit target. For read/PR
 commands without an explicit target, the repository is inferred from Git `origin`
-(HTTPS, SCP-style SSH, or SSH URL on bitbucket.org).
+(HTTPS, SCP-style SSH, or SSH URL on bitbucket.org or ssh.bitbucket.org).
 
 Lists default to `OPEN` and follow all pages. JSON lists are arrays, not page
 envelopes. JSON diffs are strings. Human output removes terminal escape sequences;
 JSON preserves API data. Errors go to stderr with exit status 1.
 Requests have a 30-second timeout per request; rate-limit errors report
 `Retry-After` when present. There are no automatic retries.
+
+### Current user and PR lists
+
+`bb whoami` prints the authenticated user's display name, nickname, account id,
+and uuid (`--json` returns the full `/user` response).
+
+`bb pr list` requests `fields=+values.reviewers,+values.participants`, so each
+listed PR includes `reviewers` and `participants` (with `approved` and `state`).
+`--author <user>` keeps PRs by that user. `--reviewer <user>` keeps PRs where the
+user is a reviewer who has neither approved nor requested changes yet. Users match
+display name or nickname substrings, or exact account id/uuid; `me` is the
+authenticated user, resolved through `/user`. Filtering happens after all pages
+are fetched.
+
+```sh
+bb pr list --reviewer me --json
+bb pr list --author me
+```
 
 ### Creating, updating, and opening PRs
 

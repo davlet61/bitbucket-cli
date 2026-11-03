@@ -24,16 +24,19 @@ import {
   getRepositoriesByWorkspaceByRepoSlugPullrequestsByPullRequestId as getPullrequest,
   getRepositoriesByWorkspaceByRepoSlugPullrequestsByPullRequestIdComments as listComments,
   getRepositoriesByWorkspaceByRepoSlugPullrequestsByPullRequestIdDiff as getDiff,
+  getUser,
 } from './generated/sdk.gen.ts';
-import type { Pullrequest } from './generated/types.gen.ts';
+import type { Account, Pullrequest } from './generated/types.gen.ts';
 
 const help = `bb — Bitbucket Cloud CLI
 
 Usage:
+  bb whoami
   bb repo create <workspace/repo> [--private | --public] [--project KEY]
       [--description <text>]
   bb repo view [workspace/repo]
-  bb pr list [--state OPEN|MERGED|DECLINED|SUPERSEDED]
+  bb pr list [--state OPEN|MERGED|DECLINED|SUPERSEDED] [--author <user>]
+      [--reviewer <user>]
   bb pr create --title <text> [--source <branch>] [--destination <branch>] [--draft]
       [--description <text> | --description-file <path|->]
   bb pr update <id> [--title <text>] [--destination <branch>]
@@ -62,14 +65,17 @@ PR creation defaults to the current Git branch and targets the repository's
 main branch unless --destination is given. Push the source branch first.
 Use --draft to create a draft PR; the response must confirm draft status.
 PR updates send only supplied fields; --description '' clears the description.
+PR lists include reviewers and participants with approval state.
+pr list --author keeps PRs by that user; --reviewer keeps PRs where that user
+is a reviewer who has not yet approved or requested changes.
 pr open launches the PR in your system browser.
 
 Comment creation defaults to pending; --publish posts it visibly right away.
 Publishing a pending comment re-creates it as published (new id) and deletes
 the draft, because Bitbucket cannot change pending state in place.
 --unresolved keeps comments in open threads; thread status is read per thread.
---author matches display name or nickname (case-insensitive), account id or uuid.
-Use --body-file <path|-> instead of
+--author and --reviewer match display name or nickname (case-insensitive), account id or uuid;
+"me" is the authenticated user. Use --body-file <path|-> instead of
 --body for a file or stdin. --line uses the new diff side unless --side old.
 --reply-to adds the comment to an existing thread, inheriting its anchor.
 Resolve and reopen act on a thread's top-level comment and are no-ops when the
@@ -101,6 +107,16 @@ function print(value: string) {
 
 function headline(pr: Pullrequest) {
   return `#${pr.id ?? '?'}  ${pr.state ?? ''}${pr.draft === true ? ' [draft]' : ''}  ${pr.title ?? ''}`;
+}
+
+function userMatcher(needle: string) {
+  const value = needle.trim().toLowerCase();
+  return (user: Account | undefined) => {
+    const fields = user as Record<string, unknown> | undefined;
+    const names = [fields?.display_name, fields?.nickname].filter((name): name is string => typeof name === 'string');
+    const ids = [fields?.account_id, fields?.uuid].filter((id): id is string => typeof id === 'string');
+    return names.some((name) => name.toLowerCase().includes(value)) || ids.some((id) => id.toLowerCase() === value);
+  };
 }
 
 function formatComment(comment: ReviewComment) {
@@ -180,6 +196,7 @@ export async function main(args = process.argv.slice(2)) {
       unresolved: { type: 'boolean' },
       author: { type: 'string' },
       port: { type: 'string' },
+      reviewer: { type: 'string' },
       json: { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
     },
@@ -192,6 +209,17 @@ export async function main(args = process.argv.slice(2)) {
   if (values.port !== undefined && !(resource === 'auth' && command === 'login')) throw new Error('--port is only supported by auth login.');
   if (resource === 'auth') {
     await auth(command, positionals, values);
+    return;
+  }
+  if (resource === 'whoami') {
+    for (const flag of Object.keys(values)) {
+      if (flag !== 'json') throw new Error(`--${flag} is not supported by whoami.`);
+    }
+    if (positionals.length !== 1) throw new Error('Unexpected or missing arguments. Run bb --help.');
+    const { data } = await getUser({ client: createBitbucketClient(), throwOnError: true });
+    const user = data as Record<string, unknown>;
+    if (values.json) console.log(JSON.stringify(data, null, 2));
+    else print(['display_name', 'nickname', 'account_id', 'uuid'].map((key) => `${key}: ${String(user[key] ?? '')}`).join('\n'));
     return;
   }
   const creationFlags = ['private', 'public', 'project', 'description'] as const;
@@ -272,11 +300,13 @@ export async function main(args = process.argv.slice(2)) {
   }
   if (values.publish && action !== 'add') throw new Error('--publish is only supported by pr comment add.');
   if (values.publish && values.pending) throw new Error('Use either --pending or --publish, not both.');
-  for (const flag of ['unresolved', 'author'] as const) {
-    if (values[flag] !== undefined && command !== 'comments') throw new Error(`--${flag} is only supported by pr comments.`);
-  }
+  if (values.unresolved !== undefined && command !== 'comments') throw new Error('--unresolved is only supported by pr comments.');
+  if (values.author !== undefined && command !== 'comments' && command !== 'list') throw new Error('--author is only supported by pr list or pr comments.');
+  if (values.reviewer !== undefined && command !== 'list') throw new Error('--reviewer is only supported by pr list.');
   if (values.unresolved && values.pending) throw new Error('Use either --pending or --unresolved, not both.');
-  if (values.author !== undefined && !values.author.trim()) throw new Error('--author must not be empty.');
+  for (const flag of ['author', 'reviewer'] as const) {
+    if (values[flag] !== undefined && !values[flag].trim()) throw new Error(`--${flag} must not be empty.`);
+  }
   const body = action === 'add' ? await commentBody(values) : undefined;
   const updatedText = action === 'update' ? await readCommentBody(values) : undefined;
 
@@ -294,8 +324,26 @@ export async function main(args = process.argv.slice(2)) {
 
   switch (command) {
     case 'list': {
-      const { data } = await listPullrequests({ ...options, path: repository, query: { state: state as Pullrequest['state'] } });
-      const prs = await collectPages(client, data);
+      // The spec omits the partial-response `fields` parameter; list responses exclude reviewers and participants without it.
+      const query = { state: state as Pullrequest['state'], fields: '+values.reviewers,+values.participants' };
+      const { data } = await listPullrequests({ ...options, path: repository, query });
+      const listed = await collectPages(client, data);
+      const needsMe = [values.author, values.reviewer].some((value) => value?.trim().toLowerCase() === 'me');
+      const me = needsMe ? (await getUser(options)).data.uuid : undefined;
+      if (needsMe && !me) throw new Error('Bitbucket did not return the authenticated user uuid.');
+      const matcher = (value: string | undefined) => value === undefined
+        ? undefined
+        : userMatcher(value.trim().toLowerCase() === 'me' ? me! : value);
+      const author = matcher(values.author);
+      const reviewer = matcher(values.reviewer);
+      const prs = listed.filter((pr) => {
+        if (author && !author(pr.author)) return false;
+        if (reviewer) {
+          if (!(pr.reviewers ?? []).some(reviewer)) return false;
+          if ((pr.participants ?? []).some((participant) => reviewer(participant.user) && (participant.approved === true || participant.state))) return false;
+        }
+        return true;
+      });
       if (values.json) json(prs);
       else print(prs.map(headline).join('\n') || 'No pull requests.');
       break;
@@ -347,7 +395,7 @@ export async function main(args = process.argv.slice(2)) {
       const onlyPending = action === 'pending' || values.pending;
       const all = onlyPending ? listed : await withThreadResolution(client, path, listed);
       const commentsById = new Map(all.map((comment) => [comment.id!, comment]));
-      const author = values.author?.trim().toLowerCase();
+      const author = values.author === undefined ? undefined : userMatcher(values.author);
       const comments = all.filter((comment) => {
         if (onlyPending && (comment.pending !== true || comment.deleted)) return false;
         if (values.unresolved) {
@@ -355,12 +403,7 @@ export async function main(args = process.argv.slice(2)) {
           const root = commentsById.get(threadRootId(comment, commentsById) ?? -1);
           if (!root || root.deleted || root.resolution) return false;
         }
-        if (author !== undefined) {
-          const user = comment.user as Record<string, unknown> | undefined;
-          const names = [user?.display_name, user?.nickname].filter((name): name is string => typeof name === 'string');
-          const ids = [user?.account_id, user?.uuid].filter((id): id is string => typeof id === 'string');
-          if (!names.some((name) => name.toLowerCase().includes(author)) && !ids.some((id) => id.toLowerCase() === author)) return false;
-        }
+        if (author && !author(comment.user)) return false;
         return true;
       });
       if (values.json) json(comments);
