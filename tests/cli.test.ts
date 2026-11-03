@@ -12,20 +12,25 @@ import { authorization, parseRepository, repositoryFromRemote } from '../src/con
 import { getRepositoriesByWorkspaceByRepoSlugPullrequests as listPullrequests } from '../src/generated/sdk.gen.ts';
 
 const authKeys = ['BITBUCKET_EMAIL', 'BITBUCKET_API_TOKEN', 'BITBUCKET_ACCESS_TOKEN'] as const;
-const originalEnv = Object.fromEntries(authKeys.map((key) => [key, process.env[key]]));
+const envKeys = [...authKeys, 'XDG_CONFIG_HOME'] as const;
+const originalEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
 const originalFetch = globalThis.fetch;
 const originalLog = console.log;
+let configHome: string;
 
-beforeEach(() => {
+beforeEach(async () => {
   for (const key of authKeys) delete process.env[key];
+  configHome = await mkdtemp(join(tmpdir(), 'bb-config-'));
+  process.env.XDG_CONFIG_HOME = configHome;
 });
-afterEach(() => {
+afterEach(async () => {
   globalThis.fetch = originalFetch;
   console.log = originalLog;
-  for (const key of authKeys) {
+  for (const key of envKeys) {
     if (originalEnv[key] === undefined) delete process.env[key];
     else process.env[key] = originalEnv[key];
   }
+  await rm(configHome, { recursive: true, force: true });
 });
 
 function respond(handler: (request: Request) => Response | Promise<Response>) {

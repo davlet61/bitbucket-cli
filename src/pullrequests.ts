@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
+import { openBrowser } from './browser.ts';
 import type { Client } from './generated/client/index.ts';
 import type { Pullrequest } from './generated/types.gen.ts';
 import {
@@ -71,9 +72,7 @@ export async function writePullrequest(client: Client, repository: RepositoryPat
 export function openPullrequest(repository: RepositoryPath, id: number, run = execFileSync, platform = process.platform): string {
   const url = `https://bitbucket.org/${encodeURIComponent(repository.workspace)}/${encodeURIComponent(repository.repo_slug)}/pull-requests/${id}`;
   try {
-    if (platform === 'darwin') run('open', [url], { stdio: 'ignore' });
-    else if (platform === 'win32') run('rundll32.exe', ['url.dll,FileProtocolHandler', url], { stdio: 'ignore' });
-    else run('xdg-open', [url], { stdio: 'ignore' });
+    openBrowser(url, run, platform);
   } catch {
     throw new Error(`Could not launch the browser. Open ${url}`);
   }

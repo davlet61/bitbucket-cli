@@ -33,21 +33,26 @@ two compiler dependencies into one.
 
 - `src/cli.ts`: argument parsing, command routing, and terminal/JSON output.
 - `src/config.ts`: environment authentication and Bitbucket Git origin inference.
-- `src/api.ts`: fetch client configuration, errors, timeouts, and pagination.
+- `src/auth.ts`: OAuth browser login, the stored credentials file, locked token
+  refresh, and auth status/logout.
+- `src/api.ts`: fetch client configuration, authentication precedence, errors,
+  timeouts, and pagination.
 - `src/comments.ts`: comment validation, pending/published lifecycle, and threads.
 - `src/repositories.ts`: repository creation and response verification.
-- `src/pullrequests.ts`: PR creation, field updates, branch inference, and browser opening.
+- `src/pullrequests.ts`: PR creation, field updates, branch inference, and PR opening.
+- `src/browser.ts`: platform browser launcher shared by `pr open` and `auth login`.
 - `src/generated/`: generated SDK, client, and API types; do not hand-edit.
 - `openapi/bitbucket.json`: upstream specification snapshot.
 - `tools/openapi/`: isolated generator workspace and its configuration.
 - `tests/cli.test.ts`: offline tests exercising the CLI through the generated SDK.
+- `tests/auth.test.ts`: offline OAuth login, refresh, locking, status, and logout tests.
 
 ## Implementation conventions
 
 - Follow the existing style: ES modules, explicit `.ts` import extensions, single
   quotes, semicolons, two-space indentation, and `import type` for type imports.
 - Keep domain behavior in handwritten modules and reuse the generated SDK for API
-  requests. Configure authentication centrally in `src/api.ts` and `src/config.ts`.
+  requests. Configure authentication centrally in `src/api.ts`, `src/config.ts`, and `src/auth.ts`.
 - Validate arguments and incompatible options before making requests. Reject
   unsupported flags rather than silently ignoring them.
 - Send only the fields required for a write. Updates must not resend unrelated
@@ -88,7 +93,9 @@ a live API discrepancy already handled in an adapter.
 - Keep tests independent of real credentials, a network connection, and the
   developer's Git origin. Restore mocked globals and environment variables, and
   clean up temporary files.
-- Treat `.env` and authentication values as secrets. Do not print, commit, or
+- Point `XDG_CONFIG_HOME` at a temporary directory in tests so a developer's
+  stored login is never read or changed.
+- Treat `.env`, the stored credentials file, and authentication values as secrets. Do not print, commit, or
   include them in command arguments, fixtures, or error messages.
 - A feature implementation request does not by itself select a live Bitbucket
   target for testing writes. Use offline fixtures unless live testing has been

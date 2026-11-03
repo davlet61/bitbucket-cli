@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { parseArgs, stripVTControlCharacters } from 'node:util';
 import { collectPages, createBitbucketClient } from './api.ts';
+import { authStatus, defaultPort, deleteLogin, environmentSource, login } from './auth.ts';
 import { resolveRepository } from './config.ts';
 import { createRepository } from './repositories.ts';
 import { openPullrequest, pullrequestChanges, writePullrequest } from './pullrequests.ts';
@@ -48,6 +49,9 @@ Usage:
   bb pr comment publish <id> <comment-id>
   bb pr comment resolve <id> <comment-id>
   bb pr comment reopen <id> <comment-id>
+  bb auth login [--port N]
+  bb auth status
+  bb auth logout
 
 Repository creation defaults to private; --public must be explicit.
 Creation requires an explicit workspace/repo (positional or --repo), refuses
@@ -73,14 +77,20 @@ thread is already in the requested state.
 Updates replace the text and retain the comment's pending/published state.
 Publication is per-comment, not a batch review submission.
 
+auth login prompts for a Bitbucket OAuth consumer key and secret (once), opens
+the browser, and receives the callback on http://127.0.0.1:${defaultPort}/callback
+(the consumer's callback URL). The login is stored in
+$XDG_CONFIG_HOME/bitbucket-cli/credentials.json (default ~/.config) and its
+access token refreshes automatically. auth logout deletes it.
+
 Options:
   --repo, -R <workspace/repo>  Defaults to Git origin
   --json                     JSON output (lists are fully paginated arrays)
   --help, -h                 Show help
 
-Authentication (environment variables):
-  BITBUCKET_EMAIL + BITBUCKET_API_TOKEN, or BITBUCKET_ACCESS_TOKEN
-  Without credentials, requests are anonymous.
+Authentication:
+  BITBUCKET_EMAIL + BITBUCKET_API_TOKEN, or BITBUCKET_ACCESS_TOKEN, if set;
+  otherwise the stored bb auth login; otherwise requests are anonymous.
 
 The CLI checks returned state after every write and never retries writes.`;
 
@@ -99,6 +109,47 @@ function formatComment(comment: ReviewComment) {
     ...(comment.inline ? [`${comment.inline.path}:${comment.inline.to ?? comment.inline.from ?? '?'}`] : []),
     comment.deleted ? '[deleted]' : comment.content?.raw ?? '',
   ].join('\n');
+}
+
+async function auth(command: string | undefined, positionals: string[], values: { port?: string; json?: boolean }) {
+  if (!['login', 'status', 'logout'].includes(command ?? '')) throw new Error('Unknown command. Run bb --help.');
+  if (positionals.length !== 2) throw new Error('Unexpected or missing arguments. Run bb --help.');
+  const allowed = new Set(command === 'login' ? ['port'] : command === 'status' ? ['json'] : []);
+  for (const flag of Object.keys(values)) {
+    if (!allowed.has(flag)) throw new Error(`--${flag} is not supported by auth ${command}.`);
+  }
+  if (command === 'login') {
+    const port = values.port === undefined ? defaultPort : /^\d{1,5}$/.test(values.port) ? Number(values.port) : NaN;
+    if (!(port >= 1 && port <= 65535)) throw new Error('--port must be an integer from 1 to 65535.');
+    const environment = environmentSource(process.env);
+    if (environment) console.error(`bb: warning: the ${environment} in BITBUCKET_* variables takes precedence over the stored login.`);
+    const result = await login(process.env, { port });
+    print([
+      'Logged in to Bitbucket.',
+      `Scopes: ${result.scope || 'none reported'}`,
+      `Access token expires ${new Date(result.expires_at).toISOString()} and refreshes automatically.`,
+    ].join('\n'));
+    return;
+  }
+  if (command === 'logout') {
+    print(await deleteLogin(process.env) ? 'Removed the stored Bitbucket login.' : 'No stored Bitbucket login.');
+    return;
+  }
+  const status = await authStatus(process.env);
+  if (values.json) {
+    console.log(JSON.stringify(status, null, 2));
+    return;
+  }
+  const stored = status.stored_login;
+  print([
+    `Active: ${status.source}`,
+    ...(stored ? [
+      `Stored login: ${status.credentials_file}${stored.active ? '' : ' (inactive: environment credentials take precedence)'}`,
+      `Consumer key: ${stored.consumer_key_present ? 'present' : 'missing'}`,
+      `Scopes: ${stored.scopes.join(' ') || 'none reported'}`,
+      `Access token ${stored.access_token_expired ? 'expired' : 'expires'} ${stored.access_token_expires_at}${stored.active ? ' (refreshes automatically)' : ''}`,
+    ] : [`Stored login: none (${status.credentials_file})`]),
+  ].join('\n'));
 }
 
 export async function main(args = process.argv.slice(2)) {
@@ -128,6 +179,7 @@ export async function main(args = process.argv.slice(2)) {
       publish: { type: 'boolean' },
       unresolved: { type: 'boolean' },
       author: { type: 'string' },
+      port: { type: 'string' },
       json: { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
     },
@@ -137,6 +189,11 @@ export async function main(args = process.argv.slice(2)) {
     return;
   }
   const [resource, command] = positionals;
+  if (values.port !== undefined && !(resource === 'auth' && command === 'login')) throw new Error('--port is only supported by auth login.');
+  if (resource === 'auth') {
+    await auth(command, positionals, values);
+    return;
+  }
   const creationFlags = ['private', 'public', 'project', 'description'] as const;
   if (resource === 'repo') {
     if (!['create', 'view'].includes(command ?? '')) throw new Error('Unknown command. Run bb --help.');

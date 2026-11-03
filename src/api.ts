@@ -1,18 +1,30 @@
+import { storedAuthorization } from './auth.ts';
 import { authorization, type Env } from './config.ts';
 import { createClient, type Client } from './generated/client/index.ts';
 
-const baseUrl = 'https://api.bitbucket.org/2.0';
+const apiOrigin = 'https://api.bitbucket.org';
+const baseUrl = `${apiOrigin}/2.0`;
 
 export function createBitbucketClient(env: Env = process.env, fetchImpl: typeof fetch = fetch) {
   const auth = authorization(env);
+  const stored = auth ? undefined : storedAuthorization(env, fetchImpl);
+  let usedStoredLogin = false;
   const client = createClient({
     baseUrl,
     headers: auth ? { Authorization: auth } : {},
     fetch: fetchImpl,
     throwOnError: true,
   });
-  // A fresh timeout for each request, not one shared deadline for the CLI session.
-  client.interceptors.request.use((request) => new Request(request, { signal: AbortSignal.timeout(30_000) }));
+  client.interceptors.request.use(async (request) => {
+    const bearer = stored && new URL(request.url).origin === apiOrigin ? await stored() : undefined;
+    // A fresh timeout for each request, started after any token refresh, not one shared deadline for the CLI session.
+    const timed = new Request(request, { signal: AbortSignal.timeout(30_000) });
+    if (bearer) {
+      timed.headers.set('Authorization', bearer);
+      usedStoredLogin = true;
+    }
+    return timed;
+  });
   client.interceptors.error.use((error, response) => {
     if (!response) return error instanceof Error ? error : new Error('Bitbucket request failed.');
     const envelope = typeof error === 'object' && error !== null && 'error' in error ? error.error : undefined;
@@ -25,7 +37,9 @@ export function createBitbucketClient(env: Env = process.env, fetchImpl: typeof 
     });
     const retry = response.headers.get('retry-after');
     const status = `Bitbucket HTTP ${response.status}${message}${retry ? ` (Retry-After: ${retry})` : ''}`;
-    return new Error([status, ...diagnostics].join('\n'));
+    const hint = !usedStoredLogin ? [] : response.status === 401 ? ['The stored Bitbucket login was rejected; run bb auth login.']
+      : response.status === 403 ? ['The OAuth consumer may lack the required permission; update it and run bb auth login.'] : [];
+    return new Error([status, ...diagnostics, ...hint].join('\n'));
   });
   return client;
 }

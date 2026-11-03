@@ -16,16 +16,19 @@ bun run bb pr diff 123 --repo workspace/repository
 bun run bb pr comments 123 --repo workspace/repository
 ```
 
-For private repositories, export credentials in your shell or copy `.env.example`
-to `.env` and fill it in locally. Never commit credentials.
+For private repositories, either log in once with `bb auth login` (see
+[OAuth login](#oauth-login)), or export credentials in your shell or copy
+`.env.example` to `.env` and fill it in locally. Never commit credentials.
 
 - `BITBUCKET_EMAIL` + `BITBUCKET_API_TOKEN`: Atlassian account email and a Bitbucket Cloud API token with repository/PR read permissions.
 - **Or** `BITBUCKET_ACCESS_TOKEN`: a Bitbucket access token or OAuth access token with the appropriate read permissions.
-- No credentials means anonymous access to public repositories.
 - Mixed or incomplete authentication configuration is rejected.
+- With none of these variables set, the login stored by `bb auth login` is used.
+- No credentials and no stored login means anonymous access to public repositories.
 
-Bun loads `.env` from the working directory. For use across repositories, export
-credentials in the calling shell; the CLI does not maintain a credential store.
+Environment credentials always take precedence over the stored login. Bun loads
+`.env` from the working directory, so a `.env` with `BITBUCKET_*` values also
+overrides the stored login there. `bb auth status` shows which source is active.
 
 ## Commands
 
@@ -49,9 +52,12 @@ bb pr comment update <id> <comment-id> --body <text>
 bb pr comment publish <id> <comment-id>
 bb pr comment resolve <id> <comment-id>
 bb pr comment reopen <id> <comment-id>
+bb auth login [--port N]
+bb auth status
+bb auth logout
 ```
 
-All commands accept `--repo` / `-R workspace/repository` and `--json`.
+All repository and PR commands accept `--repo` / `-R workspace/repository` and `--json`.
 Repository commands also accept a positional `workspace/repository`, but not
 alongside `--repo`. Repository creation always requires an explicit target. For read/PR
 commands without an explicit target, the repository is inferred from Git `origin`
@@ -244,6 +250,60 @@ Live-verified on 2026-09-30: published replies with `parent` (HTTP 201),
 resolution (200), and the 409 `Comment has already been resolved.` returned for
 an already-resolved thread. Pending replies and reopen are not yet live-verified.
 
+### OAuth login
+
+`bb auth login` signs in through the browser with a Bitbucket OAuth consumer and
+stores the result, so the CLI works from any directory without exporting tokens.
+
+Create the consumer once: in Bitbucket, open **Workspace settings → OAuth
+consumers → Add consumer**, and set:
+
+- **Callback URL**: `http://127.0.0.1:8976/callback`.
+- **This is a private consumer**: leave unchecked; it is only needed for the
+  client-credentials grant, which bb does not use.
+- **Permissions**: Pull requests **Read** (enough for reading PRs and every
+  comment command, per the API documentation) and Pull requests **Write**
+  (for `pr create` and `pr update`); Repositories **Admin** only if you use
+  `bb repo create`; Account **Read** is optional.
+
+```sh
+bb auth login          # prompts for the consumer key and secret the first time
+bb auth status         # active source, scopes, and access-token expiry
+bb auth status --json
+bb auth logout         # deletes the stored login; safe to repeat
+```
+
+Login prompts for the consumer key and secret only when no consumer is stored
+(the secret is not echoed; without a terminal, the key and secret are read as two
+lines from stdin). It then listens on `127.0.0.1:8976`, opens the authorize URL in
+the browser and prints it to stderr, verifies the returned `state`, exchanges the
+code, and prints the granted scopes and access-token expiry. It times out after
+5 minutes. `--port N` uses another port, but the consumer's callback URL must
+then be `http://127.0.0.1:N/callback`, because Bitbucket only accepts redirects
+under the configured callback. If `BITBUCKET_*` credentials are set, login warns
+that they take precedence.
+
+The login is stored in `$XDG_CONFIG_HOME/bitbucket-cli/credentials.json`
+(default `~/.config/bitbucket-cli/`), in a directory with mode 0700 and a file
+with mode 0600, written atomically. It contains the consumer key and secret,
+the access and refresh tokens, the access-token expiry, and the granted scopes.
+Bitbucket's flow requires the consumer secret because PKCE is not documented.
+Token values are never printed; `bb auth status` makes no network request.
+
+Access tokens last about two hours and are refreshed automatically when they
+expire within 5 minutes. Refresh tokens rotate on every refresh, so concurrent
+`bb` processes serialize refreshes with a lock file next to the credentials
+(waiting up to 10 seconds; a lock older than 30 seconds is treated as stale) and
+reuse a token another process has just refreshed. An unused refresh token expires
+after three months; a failed or revoked refresh asks you to run `bb auth login`
+again. Requests rejected with HTTP 401 are never retried.
+
+Scopes are fixed on the consumer; bb does not request scopes. After changing the
+consumer's permissions, run `bb auth login` again to obtain a token with them. To
+switch to a different consumer, run `bb auth logout` first. The OAuth flow is
+covered by offline tests with a local callback server and mocked token endpoint;
+it has not been verified against live Bitbucket.
+
 ### Use from other repositories
 
 The executable source can be called directly:
@@ -273,13 +333,16 @@ bun run build       # Optional standalone binary; not needed for development
 - `openapi/bitbucket.json`: unmodified upstream specification snapshot.
 - `tools/openapi/`: isolated Hey API generator workspace and `openapi-ts.config.ts`.
 - `src/generated/`: checked-in generated types, SDK functions, and fetch client; never hand-edit.
-- `src/config.ts`: authentication and Git remote inference.
-- `src/api.ts`: client configuration, errors, and guarded pagination.
+- `src/config.ts`: environment authentication and Git remote inference.
+- `src/auth.ts`: OAuth login, stored credentials, locked token refresh, status, and logout.
+- `src/api.ts`: client configuration, authentication precedence, errors, and guarded pagination.
 - `src/comments.ts`: comment input validation, pending creation, text updates, and publication.
 - `src/repositories.ts`: private-by-default creation, existing-repository guard, and write-response checks.
-- `src/pullrequests.ts`: PR creation, field updates, branch inference, and browser opening.
+- `src/pullrequests.ts`: PR creation, field updates, branch inference, and PR opening.
+- `src/browser.ts`: platform browser launcher shared by `pr open` and `auth login`.
 - `src/cli.ts`: argument handling, SDK calls, and output.
 - `tests/cli.test.ts`: offline checks through the actual generated SDK with mocked HTTP.
+- `tests/auth.test.ts`: offline OAuth login, refresh, locking, status, and logout checks.
 
 **Typechecking uses stable native TypeScript 7.0.2 (`tsc`)**, from the regular
 `typescript` package; no native-preview package is needed. `bun run typecheck` and
