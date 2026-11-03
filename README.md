@@ -26,9 +26,10 @@ For private repositories, either log in once with `bb auth login` (see
 - With none of these variables set, the login stored by `bb auth login` is used.
 - No credentials and no stored login means anonymous access to public repositories.
 
-Environment credentials always take precedence over the stored login. Bun loads
-`.env` from the working directory, so a `.env` with `BITBUCKET_*` values also
-overrides the stored login there. `bb auth status` shows which source is active.
+Environment credentials always take precedence over the stored login. Only
+`bun run bb` loads `.env` from the working directory; the compiled `bb` reads
+real environment variables only, so a project's `.env` never changes which
+credentials it uses. `bb auth status` shows which source is active.
 
 ## Commands
 
