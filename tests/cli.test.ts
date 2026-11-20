@@ -6,6 +6,7 @@ import { execFileSync } from 'node:child_process';
 import * as childProcess from 'node:child_process';
 import { openPullrequest } from '../src/pullrequests.ts';
 import { commentBody } from '../src/comments.ts';
+import { anchorStatus, parseDiff } from '../src/anchors.ts';
 import { createBitbucketClient, collectPages } from '../src/api.ts';
 import { main } from '../src/cli.ts';
 import { authorization, parseRepository, repositoryFromRemote } from '../src/config.ts';
@@ -41,6 +42,31 @@ function respond(handler: (request: Request) => Response | Promise<Response>) {
 }
 
 const collection = 'https://api.bitbucket.org/2.0/repositories/team/project/pullrequests';
+const prDiff = [
+  'diff --git a/src/file.ts b/src/file.ts',
+  '--- a/src/file.ts',
+  '+++ b/src/file.ts',
+  '@@ -7,4 +7,5 @@ function scope() {',
+  ' keep();',
+  '-removed();',
+  '+added();',
+  '+alsoAdded();',
+  ' tail();',
+  ' end();',
+  'diff --git a/src/gone.ts b/src/gone.ts',
+  '--- a/src/gone.ts',
+  '+++ /dev/null',
+  '@@ -1,2 +0,0 @@',
+  '-first();',
+  '-second();',
+  'diff --git a/src/new.ts b/src/new.ts',
+  '--- /dev/null',
+  '+++ b/src/new.ts',
+  '@@ -0,0 +1,1 @@',
+  '+created();',
+  '',
+].join('\n');
+const diffResponse = () => new Response(prDiff, { headers: { 'Content-Type': 'text/plain' } });
 
 describe('PR creation and updates', () => {
   const pr = { id: 42, state: 'OPEN', title: 'Feature', source: { branch: { name: 'feature' } }, destination: { branch: { name: 'main' } } };
@@ -470,6 +496,7 @@ describe('pending comment workflow', () => {
   test('omits the type discriminator rejected by the live comment endpoint', async () => {
     const log = spyOn(console, 'log').mockImplementation(() => {});
     const network = respond(async (request) => {
+      if (request.url.endsWith('/diff')) return diffResponse();
       const body = await request.json();
       // Recorded rejection from the authorized pending-only probe on PR #965.
       if ('type' in body) return Response.json({
@@ -480,7 +507,7 @@ describe('pending comment workflow', () => {
     for (const anchor of [[], ['--file', 'src/file.ts', '--line', '9']]) {
       await main(['pr', 'comment', 'add', '42', '-R', 'team/project', '--body', 'Diagnostic fixture', '--json', ...anchor]);
     }
-    expect(network).toHaveBeenCalledTimes(2);
+    expect(network).toHaveBeenCalledTimes(3);
     for (const call of log.mock.calls) expect(JSON.parse(call[0])).toMatchObject({ id: 7, pending: true });
   });
 
@@ -488,6 +515,7 @@ describe('pending comment workflow', () => {
     process.env.BITBUCKET_ACCESS_TOKEN = 'test-token';
     const log = spyOn(console, 'log').mockImplementation(() => {});
     const network = respond(async (request) => {
+      if (request.url === `${collection}/42/diff`) return diffResponse();
       expect(request.url).toBe(`${collection}/42/comments`);
       expect(request.method).toBe('POST');
       expect(request.headers.get('Authorization')).toBe('Bearer test-token');
@@ -496,7 +524,7 @@ describe('pending comment workflow', () => {
       return Response.json({ ...body, id: 7 }, { status: 201 });
     });
     await main(['pr', 'comment', 'add', '42', '-R', 'team/project', '--body', 'Check this', '--file', 'src/file.ts', '--line', '9', '--json']);
-    expect(network).toHaveBeenCalledTimes(1);
+    expect(network).toHaveBeenCalledTimes(2);
     expect(JSON.parse(log.mock.calls[0]?.[0])).toMatchObject({ id: 7, pending: true });
   });
 
@@ -931,5 +959,74 @@ describe('API failures and pagination safety', () => {
     const network = respond(() => Response.json({ values: [], next }));
     await expect(collectPages(createBitbucketClient({}), { values: [], next })).rejects.toThrow('repeated pagination');
     expect(network).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('diff anchors', () => {
+  test('classifies new-side and old-side lines, including added and deleted files', () => {
+    const lines = parseDiff(prDiff);
+    expect([7, 8, 9, 10, 11, 12].map((line) => anchorStatus(lines, 'new', 'src/file.ts', line)))
+      .toEqual(['context', 'changed', 'changed', 'context', 'context', 'outside']);
+    expect([7, 8, 9, 10].map((line) => anchorStatus(lines, 'old', 'src/file.ts', line)))
+      .toEqual(['context', 'changed', 'context', 'context']);
+    expect(anchorStatus(lines, 'old', 'src/gone.ts', 2)).toBe('changed');
+    expect(anchorStatus(lines, 'new', 'src/gone.ts', 1)).toBe('outside');
+    expect(anchorStatus(lines, 'new', 'src/new.ts', 1)).toBe('changed');
+  });
+
+  test('lists commentable lines per file', async () => {
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    respond(diffResponse);
+    await main(['pr', 'anchors', '42', '-R', 'team/project', '--json']);
+    expect(JSON.parse(log.mock.calls[0]?.[0])).toEqual([
+      { path: 'src/file.ts', changed: '8-9', visible: '7-11' },
+      { path: 'src/new.ts', changed: '1', visible: '1' },
+    ]);
+  });
+
+  test('checks anchors in one request and fails when any is outside the diff', async () => {
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    const network = respond(diffResponse);
+    await main(['pr', 'anchors', '42', '-R', 'team/project', 'src/file.ts:8', 'src/file.ts:7']);
+    expect(log.mock.calls[0]?.[0]).toBe('changed  src/file.ts:8\ncontext  src/file.ts:7');
+    await expect(main(['pr', 'anchors', '42', '-R', 'team/project', 'src/file.ts:8', 'src/other.ts:3']))
+      .rejects.toThrow('1 anchor(s) outside');
+    await main(['pr', 'anchors', '42', '-R', 'team/project', '--side', 'old', 'src/gone.ts:1']);
+    expect(network).toHaveBeenCalledTimes(3);
+  });
+
+  test('refuses an inline comment outside the diff without posting it', async () => {
+    const network = respond((request) => {
+      if (request.url.endsWith('/diff')) return diffResponse();
+      throw new Error('Unexpected comment POST');
+    });
+    await expect(main(['pr', 'comment', 'add', '42', '-R', 'team/project', '--body', 'x', '--file', 'src/file.ts', '--line', '40']))
+      .rejects.toThrow('nothing was posted');
+    expect(network).toHaveBeenCalledTimes(1);
+  });
+
+  test('validates anchor arguments before any request', async () => {
+    const network = respond(() => { throw new Error('Unexpected request'); });
+    for (const args of [
+      ['pr', 'anchors'], ['pr', 'anchors', '42', 'src/file.ts'], ['pr', 'anchors', '42', ':3'],
+      ['pr', 'anchors', '42', 'src/file.ts:0'], ['pr', 'anchors', '42', '--side', 'both'],
+      ['pr', 'view', '42', '--side', 'old'],
+    ]) await expect(main([...args, '-R', 'team/project'])).rejects.toThrow();
+    expect(network).not.toHaveBeenCalled();
+  });
+});
+
+describe('current user filters on comments', () => {
+  test('--author me keeps the authenticated user\'s comments', async () => {
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    respond((request) => {
+      if (request.url.endsWith('/user')) return Response.json({ uuid: '{me}' });
+      return Response.json({ values: [
+        { id: 1, user: { display_name: 'Dev One', uuid: '{me}' }, content: { raw: 'Mine' } },
+        { id: 2, user: { display_name: 'Other', uuid: '{other}' }, content: { raw: 'Theirs' } },
+      ] });
+    });
+    await main(['pr', 'comments', '42', '-R', 'team/project', '--author', 'me', '--json']);
+    expect(JSON.parse(log.mock.calls[0]?.[0]).map((comment: { id: number }) => comment.id)).toEqual([1]);
   });
 });

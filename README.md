@@ -47,6 +47,7 @@ bb pr update <id> [--title <text>] [--destination <branch>]
 bb pr open <id>
 bb pr view <id>
 bb pr diff <id>
+bb pr anchors <id> [<file>:<line> ...] [--side old|new]
 bb pr comments <id> [--pending | --unresolved] [--author <name>]
 bb pr comment add <id> --body <text> [--pending | --publish]
     [--file <path> --line <n> [--side old|new] | --reply-to <comment-id>]
@@ -197,7 +198,20 @@ bb pr comment add 123 --reply-to 456 --body-file reply.md --publish
 
 `--file` is the path in the PR, not a local file to read. `--line` is a positive,
 one-based diff line number. The new side is the default; use `--side old` for
-removed lines. General comments omit both flags. `--body-file` preserves Markdown
+removed lines. Before posting an inline comment, `comment add` reads the PR diff and
+refuses a line the diff does not show on that side, so nothing lands on a line
+reviewers cannot see.
+
+```sh
+# Commentable lines per file: changed lines, then every line the diff shows.
+bb pr anchors 123
+# Check many anchors with one diff request; exits 1 if any is outside the diff.
+bb pr anchors 123 src/file.ts:42 src/other.ts:7
+bb pr anchors 123 --side old src/removed.ts:12
+```
+
+Each checked anchor reports `changed` (an added or removed line), `context` (an
+unchanged line shown around a change, still commentable) or `outside`. General comments omit both flags. `--body-file` preserves Markdown
 and newlines; `-` reads stdin. Empty bodies and incompatible options are rejected.
 
 Creation sends `pending: true` unless `--publish` is given; then `pending` is
@@ -244,6 +258,8 @@ bb pr comments 123 --unresolved
 
 # Comments by one reviewer: display name or nickname substring, or exact account id/uuid.
 bb pr comments 123 --author nemanja --unresolved --json
+# Your own comments.
+bb pr comments 123 --author me --json
 ```
 
 The comment list always returns `resolution: null`, so `bb pr comments` reads each

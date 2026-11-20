@@ -2,6 +2,7 @@
 import { parseArgs, stripVTControlCharacters } from 'node:util';
 import { collectPages, createBitbucketClient } from './api.ts';
 import { authStatus, defaultPort, deleteLogin, environmentSource, login } from './auth.ts';
+import { anchorStatus, ranges, readDiffLines, type Side } from './anchors.ts';
 import { resolveRepository } from './config.ts';
 import { createRepository } from './repositories.ts';
 import { openPullrequest, pullrequestChanges, writePullrequest } from './pullrequests.ts';
@@ -44,6 +45,7 @@ Usage:
   bb pr open <id>
   bb pr view <id>
   bb pr diff <id>
+  bb pr anchors <id> [<file>:<line> ...] [--side old|new]
   bb pr comments <id> [--pending | --unresolved] [--author <name>]
   bb pr comment add <id> --body <text> [--pending | --publish]
       [--file <path> --line <n> [--side old|new] | --reply-to <comment-id>]
@@ -78,6 +80,9 @@ the draft, because Bitbucket cannot change pending state in place.
 "me" is the authenticated user. Use --body-file <path|-> instead of
 --body for a file or stdin. --line uses the new diff side unless --side old.
 --reply-to adds the comment to an existing thread, inheriting its anchor.
+Inline comments must anchor to a line shown in the PR diff; comment add checks
+this before posting. pr anchors lists the commentable lines per file, or checks
+each <file>:<line> (changed, context or outside) and fails if any is outside.
 Resolve and reopen act on a thread's top-level comment and are no-ops when the
 thread is already in the requested state.
 Updates replace the text and retain the comment's pending/published state.
@@ -117,6 +122,23 @@ function userMatcher(needle: string) {
     const ids = [fields?.account_id, fields?.uuid].filter((id): id is string => typeof id === 'string');
     return names.some((name) => name.toLowerCase().includes(value)) || ids.some((id) => id.toLowerCase() === value);
   };
+}
+
+async function userFilter(client: ReturnType<typeof createBitbucketClient>, value: string | undefined) {
+  if (value === undefined) return undefined;
+  if (value.trim().toLowerCase() !== 'me') return userMatcher(value);
+  const { data } = await getUser({ client, throwOnError: true });
+  if (!data.uuid) throw new Error('Bitbucket did not return the authenticated user uuid.');
+  return userMatcher(data.uuid);
+}
+
+function parseAnchors(values: string[]) {
+  return values.map((anchor) => {
+    const split = anchor.lastIndexOf(':');
+    const path = anchor.slice(0, split);
+    if (split <= 0 || !path) throw new Error(`Anchor must be <file>:<line>: ${anchor}`);
+    return { anchor, path, line: positiveId(anchor.slice(split + 1), `Line in ${anchor}`) };
+  });
 }
 
 function formatComment(comment: ReviewComment) {
@@ -275,13 +297,15 @@ export async function main(args = process.argv.slice(2)) {
     return;
   }
   const action = command === 'comment' ? positionals[2] : undefined;
-  if (resource !== 'pr' || !['list', 'view', 'open', 'diff', 'comments', 'comment'].includes(command ?? '') ||
+  if (resource !== 'pr' || !['list', 'view', 'open', 'diff', 'anchors', 'comments', 'comment'].includes(command ?? '') ||
       (command === 'comment' && !['add', 'pending', 'publish', 'update', 'resolve', 'reopen'].includes(action ?? ''))) {
     throw new Error('Unknown command. Run bb --help.');
   }
   const needsCommentId = action === 'publish' || action === 'update' || action === 'resolve' || action === 'reopen';
   const expectedArgs = command === 'list' ? 2 : command === 'comment' ? (needsCommentId ? 5 : 4) : 3;
-  if (positionals.length !== expectedArgs) throw new Error('Unexpected or missing arguments. Run bb --help.');
+  if (command === 'anchors' ? positionals.length < 3 : positionals.length !== expectedArgs) {
+    throw new Error('Unexpected or missing arguments. Run bb --help.');
+  }
   const id = command === 'list' ? undefined : positiveId(positionals[command === 'comment' ? 3 : 2], 'PR id');
   const commentId = needsCommentId ? positiveId(positionals[4], 'Comment id') : undefined;
   const state = values.state ?? 'OPEN';
@@ -292,9 +316,16 @@ export async function main(args = process.argv.slice(2)) {
       throw new Error(`--${flag} is only supported by pr comment add or update.`);
     }
   }
-  for (const flag of ['file', 'line', 'side', 'reply-to'] as const) {
+  for (const flag of ['file', 'line', 'reply-to'] as const) {
     if (values[flag] !== undefined && action !== 'add') throw new Error(`--${flag} is only supported by pr comment add.`);
   }
+  if (values.side !== undefined && action !== 'add' && command !== 'anchors') {
+    throw new Error('--side is only supported by pr comment add or pr anchors.');
+  }
+  if (command === 'anchors' && values.side !== undefined && !['old', 'new'].includes(values.side)) {
+    throw new Error('--side must be old or new.');
+  }
+  const anchors = command === 'anchors' ? parseAnchors(positionals.slice(3)) : [];
   if (values.pending && command !== 'comments' && action !== 'add' && action !== 'pending') {
     throw new Error('--pending is only supported by comments, comment pending, or comment add.');
   }
@@ -328,14 +359,7 @@ export async function main(args = process.argv.slice(2)) {
       const query = { state: state as Pullrequest['state'], fields: '+values.reviewers,+values.participants' };
       const { data } = await listPullrequests({ ...options, path: repository, query });
       const listed = await collectPages(client, data);
-      const needsMe = [values.author, values.reviewer].some((value) => value?.trim().toLowerCase() === 'me');
-      const me = needsMe ? (await getUser(options)).data.uuid : undefined;
-      if (needsMe && !me) throw new Error('Bitbucket did not return the authenticated user uuid.');
-      const matcher = (value: string | undefined) => value === undefined
-        ? undefined
-        : userMatcher(value.trim().toLowerCase() === 'me' ? me! : value);
-      const author = matcher(values.author);
-      const reviewer = matcher(values.reviewer);
+      const [author, reviewer] = await Promise.all([userFilter(client, values.author), userFilter(client, values.reviewer)]);
       const prs = listed.filter((pr) => {
         if (author && !author(pr.author)) return false;
         if (reviewer) {
@@ -362,6 +386,13 @@ export async function main(args = process.argv.slice(2)) {
     }
     case 'comment': {
       if (action === 'add') {
+        if (body!.inline) {
+          const side = body!.inline.from !== undefined ? 'old' : 'new';
+          const line = (body!.inline.from ?? body!.inline.to)!;
+          if (anchorStatus(await readDiffLines(client, path), side, body!.inline.path, line) === 'outside') {
+            throw new Error(`${body!.inline.path}:${line} is not on the ${side} side of the PR diff; nothing was posted. Run bb pr anchors ${id} to list commentable lines.`);
+          }
+        }
         const comment = await addComment(client, path, body!);
         if (values.json) json(comment);
         else print(`Created ${comment.pending ? 'pending' : 'published'} comment #${comment.id}.\n${formatComment(comment)}`);
@@ -395,7 +426,7 @@ export async function main(args = process.argv.slice(2)) {
       const onlyPending = action === 'pending' || values.pending;
       const all = onlyPending ? listed : await withThreadResolution(client, path, listed);
       const commentsById = new Map(all.map((comment) => [comment.id!, comment]));
-      const author = values.author === undefined ? undefined : userMatcher(values.author);
+      const author = await userFilter(client, values.author);
       const comments = all.filter((comment) => {
         if (onlyPending && (comment.pending !== true || comment.deleted)) return false;
         if (values.unresolved) {
@@ -408,6 +439,24 @@ export async function main(args = process.argv.slice(2)) {
       });
       if (values.json) json(comments);
       else print(comments.map(formatComment).join('\n\n') || (onlyPending ? 'No pending comments returned by Bitbucket.' : 'No matching comments.'));
+      break;
+    }
+    case 'anchors': {
+      const side = (values.side ?? 'new') as Side;
+      const lines = await readDiffLines(client, path);
+      if (!anchors.length) {
+        const files = [...lines[side]].map(([file, { visible, changed }]) => ({
+          path: file, changed: ranges(changed), visible: ranges(visible),
+        }));
+        if (values.json) json(files);
+        else print(files.map((file) => `${file.path}: ${file.changed || '-'} (visible ${file.visible})`).join('\n') || 'No commentable lines.');
+        break;
+      }
+      const checked = anchors.map((anchor) => ({ ...anchor, side, status: anchorStatus(lines, side, anchor.path, anchor.line) }));
+      if (values.json) json(checked);
+      else print(checked.map((item) => `${item.status.padEnd(8)} ${item.anchor}`).join('\n'));
+      const outside = checked.filter((item) => item.status === 'outside').length;
+      if (outside) throw new Error(`${outside} anchor(s) outside the ${side} side of the PR diff.`);
       break;
     }
     case 'diff': {
